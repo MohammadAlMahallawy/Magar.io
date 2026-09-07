@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Agar.io Clone</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #f2f6fa; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; top: 10px; left: 10px; color: #333;
+    font-family: Arial, sans-serif; font-size: 14px;
+    background: rgba(255,255,255,0.75); padding: 6px 10px; border-radius: 4px;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<div id="hud">FPS: <span id="fps">0</span> | Mass: <span id="massDisplay">20</span></div>
+<script>
+// ============================================================
+// PHASE 0 + PHASE 1 REFERENCE IMPLEMENTATION
+// Skeleton + World/Camera/Movement. Everything after this
+// point (food, bots, split, viruses, zoom/leaderboard) is
+// built by extending this same file, phase by phase.
+// ============================================================
+
+// ---------- Global constants (single source of truth) ----------
+const WORLD_WIDTH = 5000;
+const WORLD_HEIGHT = 5000;
+const GRID_SIZE = 50;
+const BASE_SPEED = 260;        // px/sec at REFERENCE_MASS
+const REFERENCE_MASS = 20;     // mass at which BASE_SPEED applies
+const SPEED_FALLOFF = 0.45;    // higher = bigger blobs slow down faster
+const MASS_RADIUS_SCALE = 6;   // radius = sqrt(mass/PI) * this
+const START_MASS = 20;
+
+// ---------- Canvas setup ----------
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+  // NOTE: canvas.width/height is the drawing buffer.
+  // canvas.style.width/height is the CSS box size.
+  // Both must be set or the canvas renders blurry/stretched.
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  canvas.style.width = window.innerWidth + 'px';
+  canvas.style.height = window.innerHeight + 'px';
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// ---------- Player (plain object, no classes) ----------
+const player = {
+  x: WORLD_WIDTH / 2,
+  y: WORLD_HEIGHT / 2,
+  mass: START_MASS,
+  radius: 0,
+  color: '#3388ff',
+  borderColor: '#1a5fb4'
+};
+
+function updateRadiusFromMass(obj) {
+  // Area scales with mass, not radius directly -> sqrt.
+  obj.radius = Math.sqrt(obj.mass / Math.PI) * MASS_RADIUS_SCALE;
+}
+updateRadiusFromMass(player);
+
+// ---------- Mouse tracking (screen space) ----------
+const mouse = { x: canvas.width / 2, y: canvas.height / 2 };
+window.addEventListener('mousemove', (e) => {
+  mouse.x = e.clientX;
+  mouse.y = e.clientY;
+});
+
+// ---------- Camera ----------
+// camera.x / camera.y are WORLD coordinates of whatever is at
+// the center of the screen. camera.zoom is a scale factor.
+const camera = { x: player.x, y: player.y, zoom: 1 };
+
+// THE single conversion function. Every draw call must go through this.
+function worldToScreen(wx, wy) {
+  return {
+    x: (wx - camera.x) * camera.zoom + canvas.width / 2,
+    y: (wy - camera.y) * camera.zoom + canvas.height / 2
+  };
+}
+
+// ---------- Movement ----------
+function updatePlayer(dt) {
+  // Player is always drawn at screen-center (camera follows player),
+  // so aim direction = vector from screen-center to mouse.
+  const dx = mouse.x - canvas.width / 2;
+  const dy = mouse.y - canvas.height / 2;
+  const dist = Math.hypot(dx, dy);
+
+  if (dist > 1) {
+    const dirX = dx / dist;
+    const dirY = dy / dist;
+    // Bigger mass -> slower. This curve is the balance knob for later phases.
+    const speed = BASE_SPEED * Math.pow(REFERENCE_MASS / player.mass, SPEED_FALLOFF);
+    player.x += dirX * speed * dt;
+    player.y += dirY * speed * dt;
+  }
+
+  // Clamp to world bounds so the player can't wander into the void.
+  player.x = Math.max(player.radius, Math.min(WORLD_WIDTH - player.radius, player.x));
+  player.y = Math.max(player.radius, Math.min(WORLD_HEIGHT - player.radius, player.y));
+
+  // Camera centers on the player (Phase 6 will change this to the
+  // average of all owned blobs once split exists).
+  camera.x = player.x;
+  camera.y = player.y;
+}
+
+// ---------- Rendering ----------
+function drawGrid() {
+  ctx.strokeStyle = '#dce8f0';
+  ctx.lineWidth = 1;
+
+  const halfW = canvas.width / 2 / camera.zoom;
+  const halfH = canvas.height / 2 / camera.zoom;
+  const startX = Math.floor((camera.x - halfW) / GRID_SIZE) * GRID_SIZE;
+  const endX = camera.x + halfW;
+  const startY = Math.floor((camera.y - halfH) / GRID_SIZE) * GRID_SIZE;
+  const endY = camera.y + halfH;
+
+  ctx.beginPath();
+  for (let gx = startX; gx <= endX; gx += GRID_SIZE) {
+    const p1 = worldToScreen(gx, startY);
+    const p2 = worldToScreen(gx, endY);
+    ctx.moveTo(p1.x, p1.y);
+    ctx.lineTo(p2.x, p2.y);
+  }
+  for (let gy = startY; gy <= endY; gy += GRID_SIZE) {
+    const p1 = worldToScreen(startX, gy);
+    const p2 = worldToScreen(endX, gy);
+    ctx.moveTo(p1.x, p1.y);
+    ctx.lineTo(p2.x, p2.y);
+  }
+  ctx.stroke();
+}
+
+function drawWorldBoundary() {
+  const topLeft = worldToScreen(0, 0);
+  const bottomRight = worldToScreen(WORLD_WIDTH, WORLD_HEIGHT);
+  ctx.save();
+  ctx.strokeStyle = '#b0c4d4';
+  ctx.lineWidth = 4;
+  ctx.setLineDash([10, 6]);
+  ctx.strokeRect(
+    topLeft.x, topLeft.y,
+    bottomRight.x - topLeft.x, bottomRight.y - topLeft.y
+  );
+  ctx.restore();
+}
+
+function drawBlob(obj) {
+  const s = worldToScreen(obj.x, obj.y);
+  const r = obj.radius * camera.zoom;
+  // Cull off-screen objects cheaply (helps once food/bots exist).
+  if (s.x + r < 0 || s.x - r > canvas.width || s.y + r < 0 || s.y - r > canvas.height) return;
+
+  ctx.beginPath();
+  ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
+  ctx.fillStyle = obj.color;
+  ctx.fill();
+  ctx.lineWidth = Math.max(2, r * 0.08);
+  ctx.strokeStyle = obj.borderColor;
+  ctx.stroke();
+}
+
+function render() {
+  ctx.fillStyle = '#f2f6fa';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  drawGrid();
+  drawWorldBoundary();
+  drawBlob(player);
+}
+
+// ---------- Game loop (rAF + delta time, never setInterval) ----------
+let lastTime = performance.now();
+let fpsAccumFrames = 0, fpsAccumTime = 0;
+const fpsEl = document.getElementById('fps');
+const massEl = document.getElementById('massDisplay');
+
+function loop(now) {
+  const dt = Math.min((now - lastTime) / 1000, 0.1); // clamp to avoid huge jumps on tab-switch
+  lastTime = now;
+
+  updatePlayer(dt);
+  render();
+
+  fpsAccumFrames++;
+  fpsAccumTime += dt;
+  if (fpsAccumTime >= 0.5) {
+    fpsEl.textContent = Math.round(fpsAccumFrames / fpsAccumTime);
+    massEl.textContent = Math.round(player.mass);
+    fpsAccumFrames = 0;
+    fpsAccumTime = 0;
+  }
+
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
