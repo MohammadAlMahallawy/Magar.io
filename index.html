@@ -48,7 +48,8 @@ const BOT_BORED_COOLDOWN = [10, 20];
 const SPLIT_MIN_MASS = 40;
 const SPLIT_KICK_SPEED = 500;
 const SPLIT_KICK_DECAY = 3.0;
-const MERGE_COOLDOWN = 15;
+const SPLIT_MERGE_DELAY = 90;       // seconds before a split lineage recombines
+const MERGE_APPROACH_WINDOW = 5;    // final seconds allow pieces to overlap/merge
 const EJECT_MASS_COST = 14;
 const EJECTED_MASS_MASS = 12;
 const EJECTED_MASS_SPEED = 700;
@@ -88,7 +89,9 @@ const player = {
 const playerBlobs = [player];
 const bots = [];
 const ejectedMass = [];
+const mergeGroups = [];
 let nextBlobId = 1;
+let nextMergeGroupId = 1;
 let gameTime = 0;
 
 function updateRadiusFromMass(obj) {
@@ -107,6 +110,27 @@ function getTotalMass(ownerId) {
     if (blob.ownerId === ownerId) total += blob.mass;
   }
   return total;
+}
+
+function createMergeGroup(memberIds, parentGroupId, now) {
+  const group = {
+    id: nextMergeGroupId++,
+    memberIds: memberIds.slice(),
+    parentGroupId,
+    mergeAt: now + SPLIT_MERGE_DELAY
+  };
+  mergeGroups.push(group);
+  return group;
+}
+
+function replaceGroupMembers(fromIds, replacementId) {
+  for (const group of mergeGroups) {
+    if (group.memberIds.some((id) => fromIds.includes(id))) {
+      group.memberIds = group.memberIds
+        .filter((id) => !fromIds.includes(id));
+      if (!group.memberIds.includes(replacementId)) group.memberIds.push(replacementId);
+    }
+  }
 }
 
 function randomRange(min, max) {
@@ -249,6 +273,13 @@ function worldToScreen(wx, wy) {
   };
 }
 
+function screenToWorld(sx, sy) {
+  return {
+    x: (sx - canvas.width / 2) / camera.zoom + camera.x,
+    y: (sy - canvas.height / 2) / camera.zoom + camera.y
+  };
+}
+
 // ---------- Movement, bots, split, and ejection ----------
 function clampBlobToWorld(blob) {
   blob.x = Math.max(blob.radius, Math.min(WORLD_WIDTH - blob.radius, blob.x));
@@ -263,9 +294,10 @@ function applyKick(blob, dt) {
   blob.vy *= decay;
 }
 
-function playerDirection() {
-  const dx = mouse.x - canvas.width / 2;
-  const dy = mouse.y - canvas.height / 2;
+function playerDirection(blob) {
+  const target = screenToWorld(mouse.x, mouse.y);
+  const dx = target.x - blob.x;
+  const dy = target.y - blob.y;
   const distance = Math.hypot(dx, dy);
   return distance > 1 ? { x: dx / distance, y: dy / distance } : { x: 0, y: 0 };
 }
@@ -279,9 +311,8 @@ function moveBlob(blob, direction, dt) {
 }
 
 function updatePlayer(dt) {
-  const direction = playerDirection();
   for (const blob of playerBlobs) {
-    moveBlob(blob, direction, dt);
+    moveBlob(blob, playerDirection(blob), dt);
   }
 
   const focus = playerBlobs[0] || player;
@@ -399,10 +430,10 @@ function splitBlob(blob, direction, now) {
   if (blob.mass < SPLIT_MIN_MASS) return null;
   if (blob.ownerId == null) blob.ownerId = blob.isBot ? blob.id : 'player';
 
+  const parentGroup = mergeGroups.find((group) => group.memberIds.includes(blob.id)) || null;
   const halfMass = blob.mass / 2;
   blob.mass = halfMass;
   updateRadiusFromMass(blob);
-  blob.mergeLockUntil = now + MERGE_COOLDOWN;
 
   const child = {
     id: (blob.isBot ? blob.ownerId : 'player') + '_piece_' + (nextBlobId++),
@@ -415,19 +446,23 @@ function splitBlob(blob, direction, now) {
     borderColor: blob.borderColor,
     vx: direction.x * SPLIT_KICK_SPEED,
     vy: direction.y * SPLIT_KICK_SPEED,
-    mergeLockUntil: now + MERGE_COOLDOWN,
     isBot: blob.isBot
   };
   updateRadiusFromMass(child);
   clampBlobToWorld(child);
+  if (parentGroup && !parentGroup.memberIds.includes(child.id)) {
+    parentGroup.memberIds.push(child.id);
+  }
+  const mergeGroup = createMergeGroup([blob.id, child.id], parentGroup ? parentGroup.id : null, now);
+  blob.mergeGroupId = mergeGroup.id;
+  child.mergeGroupId = mergeGroup.id;
   return child;
 }
 
 function splitPlayer() {
-  const direction = playerDirection();
   const additions = [];
   for (const blob of playerBlobs) {
-    const child = splitBlob(blob, direction, gameTime);
+    const child = splitBlob(blob, playerDirection(blob), gameTime);
     if (child) additions.push(child);
   }
   playerBlobs.push(...additions);
@@ -451,8 +486,9 @@ function ejectFromBlob(blob, direction) {
 }
 
 function ejectPlayerMass() {
-  const direction = playerDirection();
-  for (const blob of playerBlobs) ejectFromBlob(blob, direction);
+  for (const blob of playerBlobs) {
+    ejectFromBlob(blob, playerDirection(blob));
+  }
 }
 
 window.addEventListener('keydown', (event) => {
@@ -497,7 +533,52 @@ function removeBlob(blob) {
   if (index !== -1) collection.splice(index, 1);
 }
 
+function mergeBlobs(first, second) {
+  const totalMass = first.mass + second.mass;
+  first.x = (first.x * first.mass + second.x * second.mass) / totalMass;
+  first.y = (first.y * first.mass + second.y * second.mass) / totalMass;
+  first.mass = totalMass;
+  first.vx = 0;
+  first.vy = 0;
+  updateRadiusFromMass(first);
+  replaceGroupMembers([first.id, second.id], first.id);
+  removeBlob(second);
+}
+
+function resolveMergeGroups() {
+  let merged;
+  do {
+    merged = false;
+    for (let i = mergeGroups.length - 1; i >= 0; i--) {
+      const group = mergeGroups[i];
+      const members = group.memberIds
+        .map((id) => findBlobById(id))
+        .filter((blob) => blob !== null);
+      group.memberIds = members.map((blob) => blob.id);
+      if (members.length !== 2) continue;
+
+      const first = members[0];
+      const second = members[1];
+      const distance = Math.hypot(first.x - second.x, first.y - second.y);
+      if (gameTime >= group.mergeAt - MERGE_APPROACH_WINDOW) {
+        const pull = Math.min(1, 0.8 * (1 / 60));
+        first.x += (second.x - first.x) * pull;
+        first.y += (second.y - first.y) * pull;
+        second.x += (first.x - second.x) * pull;
+        second.y += (first.y - second.y) * pull;
+      }
+      if (gameTime >= group.mergeAt ||
+          (distance < first.radius + second.radius && gameTime >= group.mergeAt - MERGE_APPROACH_WINDOW)) {
+        mergeBlobs(first, second);
+        mergeGroups.splice(i, 1);
+        merged = true;
+      }
+    }
+  } while (merged);
+}
+
 function resolveBlobCollisions() {
+  resolveMergeGroups();
   const blobs = activeBlobs();
   for (let i = 0; i < blobs.length; i++) {
     const first = blobs[i];
@@ -507,17 +588,21 @@ function resolveBlobCollisions() {
       if (!activeBlobs().includes(second)) continue;
       const distance = Math.hypot(first.x - second.x, first.y - second.y);
       if (first.ownerId === second.ownerId) {
-        if (gameTime >= first.mergeLockUntil && gameTime >= second.mergeLockUntil &&
-            distance < first.radius + second.radius) {
-          const totalMass = first.mass + second.mass;
-          first.x = (first.x * first.mass + second.x * second.mass) / totalMass;
-          first.y = (first.y * first.mass + second.y * second.mass) / totalMass;
-          first.mass = totalMass;
-          first.vx = 0;
-          first.vy = 0;
-          first.mergeLockUntil = 0;
-          updateRadiusFromMass(first);
-          removeBlob(second);
+        const mergeGroup = mergeGroups.find((group) =>
+          group.memberIds.includes(first.id) && group.memberIds.includes(second.id)
+        );
+        if (mergeGroup && gameTime >= mergeGroup.mergeAt - MERGE_APPROACH_WINDOW) continue;
+        if (distance < first.radius + second.radius) {
+          const minimumDistance = first.radius + second.radius;
+          const separation = Math.max(0.001, minimumDistance - distance);
+          const normalX = distance > 0 ? (second.x - first.x) / distance : 1;
+          const normalY = distance > 0 ? (second.y - first.y) / distance : 0;
+          first.x -= normalX * separation / 2;
+          first.y -= normalY * separation / 2;
+          second.x += normalX * separation / 2;
+          second.y += normalY * separation / 2;
+          clampBlobToWorld(first);
+          clampBlobToWorld(second);
         }
         continue;
       }
