@@ -34,6 +34,25 @@ const REFERENCE_MASS = 20;     // mass at which BASE_SPEED applies
 const SPEED_FALLOFF = 0.45;    // higher = bigger blobs slow down faster
 const MASS_RADIUS_SCALE = 6;   // radius = sqrt(mass/PI) * this
 const START_MASS = 20;
+const FOOD_COUNT = 500;
+const FOOD_RADIUS = 6;         // world units
+const FOOD_MASS_GAIN = 1;      // mass added per food eaten
+const FOOD_COLORS = ['#ff3b8d', '#8e44ff', '#b7e532', '#19d3ff', '#ff9f1c', '#ff4d4d', '#3388ff'];
+const BOT_COUNT = 14;
+const BOT_DIFFICULTY_WEIGHTS = { easy: 0.50, medium: 0.35, hard: 0.15 };
+const BOT_DETECTION_RADIUS = 600;
+const BOT_EAT_MARGIN = 1.25;
+const BOT_REEVAL_INTERVAL = { easy: 1.0, medium: 0.5, hard: 0.2 };
+const BOT_BORED_AFTER = [8, 15];
+const BOT_BORED_COOLDOWN = [10, 20];
+const SPLIT_MIN_MASS = 40;
+const SPLIT_KICK_SPEED = 500;
+const SPLIT_KICK_DECAY = 3.0;
+const MERGE_COOLDOWN = 15;
+const EJECT_MASS_COST = 14;
+const EJECTED_MASS_MASS = 12;
+const EJECTED_MASS_SPEED = 700;
+const EJECTED_MASS_DECAY = 4.0;
 
 // ---------- Canvas setup ----------
 const canvas = document.getElementById('gameCanvas');
@@ -53,19 +72,162 @@ resizeCanvas();
 
 // ---------- Player (plain object, no classes) ----------
 const player = {
+  id: 'player_1',
+  ownerId: 'player',
   x: WORLD_WIDTH / 2,
   y: WORLD_HEIGHT / 2,
   mass: START_MASS,
   radius: 0,
   color: '#3388ff',
-  borderColor: '#1a5fb4'
+  borderColor: '#1a5fb4',
+  vx: 0,
+  vy: 0,
+  mergeLockUntil: 0,
+  isBot: false
 };
+const playerBlobs = [player];
+const bots = [];
+const ejectedMass = [];
+let nextBlobId = 1;
+let gameTime = 0;
 
 function updateRadiusFromMass(obj) {
   // Area scales with mass, not radius directly -> sqrt.
   obj.radius = Math.sqrt(obj.mass / Math.PI) * MASS_RADIUS_SCALE;
 }
 updateRadiusFromMass(player);
+
+function activeBlobs() {
+  return playerBlobs.concat(bots);
+}
+
+function getTotalMass(ownerId) {
+  let total = 0;
+  for (const blob of activeBlobs()) {
+    if (blob.ownerId === ownerId) total += blob.mass;
+  }
+  return total;
+}
+
+function randomRange(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+function randomBotDifficulty() {
+  const roll = Math.random();
+  if (roll < BOT_DIFFICULTY_WEIGHTS.easy) return 'easy';
+  if (roll < BOT_DIFFICULTY_WEIGHTS.easy + BOT_DIFFICULTY_WEIGHTS.medium) return 'medium';
+  return 'hard';
+}
+
+function randomDuration(range) {
+  return randomRange(range[0], range[1]);
+}
+
+function randomSpawnPosition(radius) {
+  return {
+    x: radius + Math.random() * (WORLD_WIDTH - radius * 2),
+    y: radius + Math.random() * (WORLD_HEIGHT - radius * 2)
+  };
+}
+
+function createBot(index) {
+  const difficulty = randomBotDifficulty();
+  const mass = randomRange(14, 42);
+  const bot = {
+    id: 'bot_' + index,
+    ownerId: 'bot_' + index,
+    x: 0,
+    y: 0,
+    mass,
+    radius: 0,
+    color: FOOD_COLORS[index % FOOD_COLORS.length],
+    borderColor: '#24506f',
+    vx: 0,
+    vy: 0,
+    mergeLockUntil: 0,
+    isBot: true,
+    state: 'SEEKING_FOOD',
+    difficulty,
+    targetId: null,
+    nextEvalAt: 0,
+    boredUntil: 0,
+    boredTargetId: null,
+    huntStartedAt: 0,
+    boredAfter: randomDuration(BOT_BORED_AFTER),
+    wanderX: 0,
+    wanderY: 0,
+    canSplit: difficulty !== 'easy',
+    canEject: difficulty !== 'easy'
+  };
+  updateRadiusFromMass(bot);
+
+  let position = randomSpawnPosition(bot.radius);
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const tooClose = activeBlobs().some((blob) =>
+      Math.hypot(position.x - blob.x, position.y - blob.y) < bot.radius + blob.radius + 100
+    );
+    if (!tooClose) break;
+    position = randomSpawnPosition(bot.radius);
+  }
+  bot.x = position.x;
+  bot.y = position.y;
+  bot.wanderX = bot.x;
+  bot.wanderY = bot.y;
+  return bot;
+}
+
+// ---------- Food ----------
+const food = [];
+
+for (let i = 0; i < BOT_COUNT; i++) {
+  bots.push(createBot(i + 1));
+}
+
+function randomFoodColor() {
+  return FOOD_COLORS[Math.floor(Math.random() * FOOD_COLORS.length)];
+}
+
+function randomFoodPosition() {
+  const maxX = WORLD_WIDTH - FOOD_RADIUS;
+  const maxY = WORLD_HEIGHT - FOOD_RADIUS;
+  return {
+    x: FOOD_RADIUS + Math.random() * (maxX - FOOD_RADIUS),
+    y: FOOD_RADIUS + Math.random() * (maxY - FOOD_RADIUS)
+  };
+}
+
+function spawnFood() {
+  let position = randomFoodPosition();
+  for (let attempt = 0; attempt < 20; attempt++) {
+    if (activeBlobs().every((blob) =>
+      Math.hypot(position.x - blob.x, position.y - blob.y) >= blob.radius + FOOD_RADIUS
+    )) {
+      break;
+    }
+    position = randomFoodPosition();
+  }
+  food.push({ x: position.x, y: position.y, radius: FOOD_RADIUS, color: randomFoodColor() });
+}
+
+for (let i = 0; i < FOOD_COUNT; i++) {
+  spawnFood();
+}
+
+function updateFood() {
+  for (let i = food.length - 1; i >= 0; i--) {
+    const item = food[i];
+    const eater = activeBlobs().find((blob) =>
+      Math.hypot(item.x - blob.x, item.y - blob.y) < blob.radius + item.radius
+    );
+    if (eater) {
+      eater.mass += FOOD_MASS_GAIN;
+      updateRadiusFromMass(eater);
+      food.splice(i, 1);
+      spawnFood();
+    }
+  }
+}
 
 // ---------- Mouse tracking (screen space) ----------
 const mouse = { x: canvas.width / 2, y: canvas.height / 2 };
@@ -87,31 +249,289 @@ function worldToScreen(wx, wy) {
   };
 }
 
-// ---------- Movement ----------
-function updatePlayer(dt) {
-  // Player is always drawn at screen-center (camera follows player),
-  // so aim direction = vector from screen-center to mouse.
+// ---------- Movement, bots, split, and ejection ----------
+function clampBlobToWorld(blob) {
+  blob.x = Math.max(blob.radius, Math.min(WORLD_WIDTH - blob.radius, blob.x));
+  blob.y = Math.max(blob.radius, Math.min(WORLD_HEIGHT - blob.radius, blob.y));
+}
+
+function applyKick(blob, dt) {
+  const decay = Math.max(0, 1 - SPLIT_KICK_DECAY * dt);
+  blob.x += blob.vx * dt;
+  blob.y += blob.vy * dt;
+  blob.vx *= decay;
+  blob.vy *= decay;
+}
+
+function playerDirection() {
   const dx = mouse.x - canvas.width / 2;
   const dy = mouse.y - canvas.height / 2;
-  const dist = Math.hypot(dx, dy);
+  const distance = Math.hypot(dx, dy);
+  return distance > 1 ? { x: dx / distance, y: dy / distance } : { x: 0, y: 0 };
+}
 
-  if (dist > 1) {
-    const dirX = dx / dist;
-    const dirY = dy / dist;
-    // Bigger mass -> slower. This curve is the balance knob for later phases.
-    const speed = BASE_SPEED * Math.pow(REFERENCE_MASS / player.mass, SPEED_FALLOFF);
-    player.x += dirX * speed * dt;
-    player.y += dirY * speed * dt;
+function moveBlob(blob, direction, dt) {
+  applyKick(blob, dt);
+  const speed = BASE_SPEED * Math.pow(REFERENCE_MASS / Math.max(1, blob.mass), SPEED_FALLOFF);
+  blob.x += direction.x * speed * dt;
+  blob.y += direction.y * speed * dt;
+  clampBlobToWorld(blob);
+}
+
+function updatePlayer(dt) {
+  const direction = playerDirection();
+  for (const blob of playerBlobs) {
+    moveBlob(blob, direction, dt);
   }
 
-  // Clamp to world bounds so the player can't wander into the void.
-  player.x = Math.max(player.radius, Math.min(WORLD_WIDTH - player.radius, player.x));
-  player.y = Math.max(player.radius, Math.min(WORLD_HEIGHT - player.radius, player.y));
+  const focus = playerBlobs[0] || player;
+  camera.x = focus.x;
+  camera.y = focus.y;
+}
 
-  // Camera centers on the player (Phase 6 will change this to the
-  // average of all owned blobs once split exists).
-  camera.x = player.x;
-  camera.y = player.y;
+function findBlobById(id) {
+  return activeBlobs().find((blob) => blob.id === id) || null;
+}
+
+function chooseWanderPoint(bot) {
+  const angle = Math.random() * Math.PI * 2;
+  const distance = randomRange(BOT_DETECTION_RADIUS * 0.35, BOT_DETECTION_RADIUS);
+  bot.wanderX = Math.max(bot.radius, Math.min(WORLD_WIDTH - bot.radius, bot.x + Math.cos(angle) * distance));
+  bot.wanderY = Math.max(bot.radius, Math.min(WORLD_HEIGHT - bot.radius, bot.y + Math.sin(angle) * distance));
+}
+
+function blobsNear(bot) {
+  return activeBlobs().filter((blob) => {
+    if (blob === bot || blob.ownerId === bot.ownerId) return false;
+    return Math.hypot(blob.x - bot.x, blob.y - bot.y) <= BOT_DETECTION_RADIUS;
+  });
+}
+
+function reevaluateBot(bot, now) {
+  if (now < bot.nextEvalAt) return;
+  bot.nextEvalAt = now + BOT_REEVAL_INTERVAL[bot.difficulty];
+
+  const nearby = blobsNear(bot);
+  const threat = nearby
+    .filter((blob) => blob.mass > bot.mass * BOT_EAT_MARGIN)
+    .sort((a, b) => Math.hypot(a.x - bot.x, a.y - bot.y) - Math.hypot(b.x - bot.x, b.y - bot.y))[0];
+  if (threat) {
+    bot.state = 'FLEEING';
+    bot.targetId = threat.id;
+    return;
+  }
+
+  const currentTarget = bot.targetId ? findBlobById(bot.targetId) : null;
+  if (bot.state === 'HUNTING' && currentTarget &&
+      now - bot.huntStartedAt >= bot.boredAfter) {
+    bot.state = 'BORED';
+    bot.boredTargetId = bot.targetId;
+    bot.targetId = null;
+    bot.boredUntil = now + randomDuration(BOT_BORED_COOLDOWN);
+    return;
+  }
+
+  if (now < bot.boredUntil) {
+    bot.state = 'BORED';
+    bot.targetId = null;
+    return;
+  }
+  const blockedTargetId = bot.boredTargetId;
+  bot.boredTargetId = null;
+
+  const prey = nearby
+    .filter((blob) =>
+      blob.id !== blockedTargetId &&
+      blob.mass < bot.mass / BOT_EAT_MARGIN
+    )
+    .sort((a, b) => b.mass - a.mass)[0];
+  if (prey) {
+    if (bot.targetId !== prey.id) {
+      bot.huntStartedAt = now;
+      bot.boredAfter = randomDuration(BOT_BORED_AFTER);
+    }
+    bot.state = 'HUNTING';
+    bot.targetId = prey.id;
+  } else {
+    bot.state = now < bot.boredUntil ? 'BORED' : 'SEEKING_FOOD';
+    bot.targetId = null;
+  }
+}
+
+function botDirection(bot) {
+  const target = bot.targetId ? findBlobById(bot.targetId) : null;
+  if (bot.state === 'FLEEING' && target) {
+    const distance = Math.hypot(bot.x - target.x, bot.y - target.y) || 1;
+    return { x: (bot.x - target.x) / distance, y: (bot.y - target.y) / distance };
+  }
+  if (bot.state === 'HUNTING' && target) {
+    const distance = Math.hypot(target.x - bot.x, target.y - bot.y) || 1;
+    return { x: (target.x - bot.x) / distance, y: (target.y - bot.y) / distance };
+  }
+
+  let nearestFood = null;
+  let nearestDistance = BOT_DETECTION_RADIUS;
+  for (const item of food) {
+    const distance = Math.hypot(item.x - bot.x, item.y - bot.y);
+    if (distance < nearestDistance) {
+      nearestFood = item;
+      nearestDistance = distance;
+    }
+  }
+  if (nearestFood) {
+    const distance = Math.max(1, nearestDistance);
+    return { x: (nearestFood.x - bot.x) / distance, y: (nearestFood.y - bot.y) / distance };
+  }
+
+  if (Math.hypot(bot.wanderX - bot.x, bot.wanderY - bot.y) < 20) chooseWanderPoint(bot);
+  const distance = Math.max(1, Math.hypot(bot.wanderX - bot.x, bot.wanderY - bot.y));
+  return { x: (bot.wanderX - bot.x) / distance, y: (bot.wanderY - bot.y) / distance };
+}
+
+function updateBots(dt, now) {
+  for (const bot of bots) {
+    reevaluateBot(bot, now);
+    moveBlob(bot, botDirection(bot), dt);
+  }
+}
+
+function splitBlob(blob, direction, now) {
+  if (blob.mass < SPLIT_MIN_MASS) return null;
+  if (blob.ownerId == null) blob.ownerId = blob.isBot ? blob.id : 'player';
+
+  const halfMass = blob.mass / 2;
+  blob.mass = halfMass;
+  updateRadiusFromMass(blob);
+  blob.mergeLockUntil = now + MERGE_COOLDOWN;
+
+  const child = {
+    id: (blob.isBot ? blob.ownerId : 'player') + '_piece_' + (nextBlobId++),
+    ownerId: blob.ownerId,
+    x: blob.x + direction.x * (blob.radius + halfMass),
+    y: blob.y + direction.y * (blob.radius + halfMass),
+    mass: halfMass,
+    radius: 0,
+    color: blob.color,
+    borderColor: blob.borderColor,
+    vx: direction.x * SPLIT_KICK_SPEED,
+    vy: direction.y * SPLIT_KICK_SPEED,
+    mergeLockUntil: now + MERGE_COOLDOWN,
+    isBot: blob.isBot
+  };
+  updateRadiusFromMass(child);
+  clampBlobToWorld(child);
+  return child;
+}
+
+function splitPlayer() {
+  const direction = playerDirection();
+  const additions = [];
+  for (const blob of playerBlobs) {
+    const child = splitBlob(blob, direction, gameTime);
+    if (child) additions.push(child);
+  }
+  playerBlobs.push(...additions);
+}
+
+function ejectFromBlob(blob, direction) {
+  if (blob.mass <= EJECT_MASS_COST + EJECTED_MASS_MASS) return;
+  blob.mass -= EJECT_MASS_COST;
+  updateRadiusFromMass(blob);
+  const radius = Math.sqrt(EJECTED_MASS_MASS / Math.PI) * MASS_RADIUS_SCALE;
+  const item = {
+    x: blob.x + direction.x * (blob.radius + radius),
+    y: blob.y + direction.y * (blob.radius + radius),
+    vx: direction.x * EJECTED_MASS_SPEED,
+    vy: direction.y * EJECTED_MASS_SPEED,
+    mass: EJECTED_MASS_MASS,
+    radius,
+    ownerId: blob.ownerId
+  };
+  ejectedMass.push(item);
+}
+
+function ejectPlayerMass() {
+  const direction = playerDirection();
+  for (const blob of playerBlobs) ejectFromBlob(blob, direction);
+}
+
+window.addEventListener('keydown', (event) => {
+  if (event.code === 'Space') {
+    event.preventDefault();
+    splitPlayer();
+  } else if (event.key && event.key.toLowerCase() === 'w') {
+    ejectPlayerMass();
+  }
+});
+
+function updateEjectedMass(dt) {
+  const decay = Math.max(0, 1 - EJECTED_MASS_DECAY * dt);
+  for (const item of ejectedMass) {
+    item.x += item.vx * dt;
+    item.y += item.vy * dt;
+    item.vx *= decay;
+    item.vy *= decay;
+    item.x = Math.max(item.radius, Math.min(WORLD_WIDTH - item.radius, item.x));
+    item.y = Math.max(item.radius, Math.min(WORLD_HEIGHT - item.radius, item.y));
+  }
+}
+
+function resolveEjectedMass() {
+  for (let i = ejectedMass.length - 1; i >= 0; i--) {
+    const item = ejectedMass[i];
+    const eater = activeBlobs().find((blob) =>
+      Math.hypot(item.x - blob.x, item.y - blob.y) < blob.radius + item.radius &&
+      (blob.ownerId !== item.ownerId || Math.hypot(item.x - blob.x, item.y - blob.y) > blob.radius)
+    );
+    if (eater) {
+      eater.mass += item.mass;
+      updateRadiusFromMass(eater);
+      ejectedMass.splice(i, 1);
+    }
+  }
+}
+
+function removeBlob(blob) {
+  const collection = blob.isBot ? bots : playerBlobs;
+  const index = collection.indexOf(blob);
+  if (index !== -1) collection.splice(index, 1);
+}
+
+function resolveBlobCollisions() {
+  const blobs = activeBlobs();
+  for (let i = 0; i < blobs.length; i++) {
+    const first = blobs[i];
+    if (!activeBlobs().includes(first)) continue;
+    for (let j = i + 1; j < blobs.length; j++) {
+      const second = blobs[j];
+      if (!activeBlobs().includes(second)) continue;
+      const distance = Math.hypot(first.x - second.x, first.y - second.y);
+      if (first.ownerId === second.ownerId) {
+        if (gameTime >= first.mergeLockUntil && gameTime >= second.mergeLockUntil &&
+            distance < first.radius + second.radius) {
+          const totalMass = first.mass + second.mass;
+          first.x = (first.x * first.mass + second.x * second.mass) / totalMass;
+          first.y = (first.y * first.mass + second.y * second.mass) / totalMass;
+          first.mass = totalMass;
+          first.vx = 0;
+          first.vy = 0;
+          first.mergeLockUntil = 0;
+          updateRadiusFromMass(first);
+          removeBlob(second);
+        }
+        continue;
+      }
+
+      if (distance >= Math.max(first.radius, second.radius)) continue;
+      const larger = first.mass > second.mass * BOT_EAT_MARGIN ? first :
+        second.mass > first.mass * BOT_EAT_MARGIN ? second : null;
+      if (!larger) continue;
+      const smaller = larger === first ? second : first;
+      larger.mass += smaller.mass;
+      updateRadiusFromMass(larger);
+      removeBlob(smaller);
+    }
+  }
 }
 
 // ---------- Rendering ----------
@@ -171,12 +591,43 @@ function drawBlob(obj) {
   ctx.stroke();
 }
 
+function drawFood() {
+  for (const item of food) {
+    const s = worldToScreen(item.x, item.y);
+    const r = item.radius * camera.zoom;
+    if (s.x + r < 0 || s.x - r > canvas.width || s.y + r < 0 || s.y - r > canvas.height) continue;
+
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = item.color;
+    ctx.fill();
+  }
+}
+
+function drawEjectedMass() {
+  for (const item of ejectedMass) {
+    const s = worldToScreen(item.x, item.y);
+    const r = item.radius * camera.zoom;
+    if (s.x + r < 0 || s.x - r > canvas.width || s.y + r < 0 || s.y - r > canvas.height) continue;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = '#65c466';
+    ctx.fill();
+    ctx.strokeStyle = '#31843a';
+    ctx.lineWidth = Math.max(1, r * 0.08);
+    ctx.stroke();
+  }
+}
+
 function render() {
   ctx.fillStyle = '#f2f6fa';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   drawGrid();
   drawWorldBoundary();
-  drawBlob(player);
+  drawFood();
+  drawEjectedMass();
+  for (const bot of bots) drawBlob(bot);
+  for (const blob of playerBlobs) drawBlob(blob);
 }
 
 // ---------- Game loop (rAF + delta time, never setInterval) ----------
@@ -190,17 +641,23 @@ function loop(now) {
   lastTime = now;
 
   updatePlayer(dt);
+  updateBots(dt, gameTime);
+  updateFood();
+  updateEjectedMass(dt);
+  resolveEjectedMass();
+  resolveBlobCollisions();
   render();
 
   fpsAccumFrames++;
   fpsAccumTime += dt;
   if (fpsAccumTime >= 0.5) {
     fpsEl.textContent = Math.round(fpsAccumFrames / fpsAccumTime);
-    massEl.textContent = Math.round(player.mass);
+    massEl.textContent = Math.round(getTotalMass('player'));
     fpsAccumFrames = 0;
     fpsAccumTime = 0;
   }
 
+  gameTime += dt;
   requestAnimationFrame(loop);
 }
 requestAnimationFrame(loop);
