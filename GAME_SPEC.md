@@ -4,10 +4,10 @@ This is the single source of truth to paste/attach alongside every phase prompt
 given to the builder model. It exists so numbers and rules don't drift between
 sessions with a model that has no memory of earlier conversations.
 
-**Status:** Phase 0 and Phase 1 are already implemented in `index.html`
-(skeleton, resize handling, rAF game loop with delta time, world/camera
-system, player movement, grid + boundary rendering). Everything from Phase 2
-onward is built by *extending that same file*, phase by phase.
+**Status:** Phases 0 through 6 are implemented in `index.html` (single-file
+skeleton, food, bots, split/eject, viruses, camera framing/zoom, and a
+throttled leaderboard). This document remains the source of truth for the
+constants and acceptance details.
 
 ---
 
@@ -91,6 +91,7 @@ const VIRUS_FIRE_THRESHOLD = 150;      // mass at which a fed virus fires
 const VIRUS_FIRE_DISTANCE = 800;       // world units it launches
 const VIRUS_POP_MIN_PIECES = 3;
 const VIRUS_POP_MAX_PIECES = 7;
+const VIRUS_RESPAWN_DELAY = 1.5;       // seconds after a pop
 
 // Camera / leaderboard (Phase 6)
 const BASE_ZOOM = 1.0;
@@ -134,7 +135,10 @@ one phase's code.
 { x, y, radius: FOOD_RADIUS, color }
 
 // Virus
-{ x, y, mass: VIRUS_BASE_MASS, radius, vx: 0, vy: 0, firing: false }
+{
+  x, y, mass: VIRUS_BASE_MASS, radius, vx: 0, vy: 0,
+  firing: false, active: true, travelRemaining: 0, respawnAt: 0
+}
 
 // Ejected mass
 { x, y, vx, vy, mass: EJECTED_MASS_MASS, radius, ownerId }
