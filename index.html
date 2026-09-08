@@ -45,6 +45,8 @@ const BOT_EAT_MARGIN = 1.25;
 const BOT_REEVAL_INTERVAL = { easy: 1.0, medium: 0.5, hard: 0.2 };
 const BOT_BORED_AFTER = [8, 15];
 const BOT_BORED_COOLDOWN = [10, 20];
+const BOT_PREDICTION_TIME = { easy: 0.15, medium: 0.35, hard: 0.65 };
+const BOT_BOUNDARY_MARGIN = 180;
 const SPLIT_MIN_MASS = 40;
 const SPLIT_KICK_SPEED = 500;
 const SPLIT_KICK_DECAY = 3.0;
@@ -157,6 +159,8 @@ function createBot(index) {
     boredAfter: randomDuration(BOT_BORED_AFTER),
     wanderX: 0,
     wanderY: 0,
+    targetX: 0,
+    targetY: 0,
     canSplit: difficulty !== 'easy',
     canEject: difficulty !== 'easy'
   };
@@ -319,12 +323,19 @@ function reevaluateBot(bot, now) {
   bot.nextEvalAt = now + BOT_REEVAL_INTERVAL[bot.difficulty];
 
   const nearby = blobsNear(bot);
-  const threat = nearby
+  const threats = nearby
     .filter((blob) => blob.mass > bot.mass * BOT_EAT_MARGIN)
-    .sort((a, b) => Math.hypot(a.x - bot.x, a.y - bot.y) - Math.hypot(b.x - bot.x, b.y - bot.y))[0];
+    .sort((a, b) => {
+      const distanceA = Math.hypot(a.x - bot.x, a.y - bot.y);
+      const distanceB = Math.hypot(b.x - bot.x, b.y - bot.y);
+      return (distanceA / a.mass) - (distanceB / b.mass);
+    });
+  const threat = threats[0];
   if (threat) {
     bot.state = 'FLEEING';
     bot.targetId = threat.id;
+    bot.targetX = threat.x;
+    bot.targetY = threat.y;
     return;
   }
 
@@ -351,7 +362,13 @@ function reevaluateBot(bot, now) {
       blob.id !== blockedTargetId &&
       blob.mass < bot.mass / BOT_EAT_MARGIN
     )
-    .sort((a, b) => b.mass - a.mass)[0];
+    .sort((a, b) => {
+      const score = (blob) => {
+        const distance = Math.hypot(blob.x - bot.x, blob.y - bot.y);
+        return blob.mass / Math.max(100, distance);
+      };
+      return score(b) - score(a);
+    })[0];
   if (prey) {
     if (bot.targetId !== prey.id) {
       bot.huntStartedAt = now;
@@ -359,40 +376,85 @@ function reevaluateBot(bot, now) {
     }
     bot.state = 'HUNTING';
     bot.targetId = prey.id;
+    bot.targetX = prey.x;
+    bot.targetY = prey.y;
   } else {
     bot.state = now < bot.boredUntil ? 'BORED' : 'SEEKING_FOOD';
     bot.targetId = null;
+    bot.targetX = 0;
+    bot.targetY = 0;
   }
+}
+
+function addDirection(first, second, weight) {
+  return {
+    x: first.x + second.x * weight,
+    y: first.y + second.y * weight
+  };
+}
+
+function normalizeDirection(direction) {
+  const length = Math.hypot(direction.x, direction.y);
+  return length > 0.001 ? { x: direction.x / length, y: direction.y / length } : { x: 0, y: 0 };
 }
 
 function botDirection(bot) {
   const target = bot.targetId ? findBlobById(bot.targetId) : null;
   if (bot.state === 'FLEEING' && target) {
-    const distance = Math.hypot(bot.x - target.x, bot.y - target.y) || 1;
-    return { x: (bot.x - target.x) / distance, y: (bot.y - target.y) / distance };
+    const threatDirection = normalizeDirection({ x: bot.x - target.x, y: bot.y - target.y });
+    const boundaryDirection = {
+      x: bot.x < BOT_BOUNDARY_MARGIN ? 1 : bot.x > WORLD_WIDTH - BOT_BOUNDARY_MARGIN ? -1 : 0,
+      y: bot.y < BOT_BOUNDARY_MARGIN ? 1 : bot.y > WORLD_HEIGHT - BOT_BOUNDARY_MARGIN ? -1 : 0
+    };
+    return normalizeDirection(addDirection(threatDirection, boundaryDirection, 2));
   }
   if (bot.state === 'HUNTING' && target) {
-    const distance = Math.hypot(target.x - bot.x, target.y - bot.y) || 1;
-    return { x: (target.x - bot.x) / distance, y: (target.y - bot.y) / distance };
+    const prediction = BOT_PREDICTION_TIME[bot.difficulty];
+    const predictedTarget = {
+      x: target.x + target.vx * prediction,
+      y: target.y + target.vy * prediction
+    };
+    bot.targetX = predictedTarget.x;
+    bot.targetY = predictedTarget.y;
+    return normalizeDirection({ x: predictedTarget.x - bot.x, y: predictedTarget.y - bot.y });
   }
 
   let nearestFood = null;
-  let nearestDistance = BOT_DETECTION_RADIUS;
+  let bestFoodScore = -Infinity;
   for (const item of food) {
     const distance = Math.hypot(item.x - bot.x, item.y - bot.y);
-    if (distance < nearestDistance) {
-      nearestFood = item;
-      nearestDistance = distance;
+    if (distance <= BOT_DETECTION_RADIUS) {
+      const score = (BOT_DETECTION_RADIUS - distance) / BOT_DETECTION_RADIUS;
+      if (score > bestFoodScore) {
+        bestFoodScore = score;
+        nearestFood = item;
+      }
     }
   }
   if (nearestFood) {
-    const distance = Math.max(1, nearestDistance);
-    return { x: (nearestFood.x - bot.x) / distance, y: (nearestFood.y - bot.y) / distance };
+    const boundaryDirection = {
+      x: bot.x < BOT_BOUNDARY_MARGIN ? 1 : bot.x > WORLD_WIDTH - BOT_BOUNDARY_MARGIN ? -1 : 0,
+      y: bot.y < BOT_BOUNDARY_MARGIN ? 1 : bot.y > WORLD_HEIGHT - BOT_BOUNDARY_MARGIN ? -1 : 0
+    };
+    return normalizeDirection(addDirection(
+      { x: nearestFood.x - bot.x, y: nearestFood.y - bot.y },
+      boundaryDirection,
+      BOT_BOUNDARY_MARGIN
+    ));
   }
 
   if (Math.hypot(bot.wanderX - bot.x, bot.wanderY - bot.y) < 20) chooseWanderPoint(bot);
-  const distance = Math.max(1, Math.hypot(bot.wanderX - bot.x, bot.wanderY - bot.y));
-  return { x: (bot.wanderX - bot.x) / distance, y: (bot.wanderY - bot.y) / distance };
+  const wanderDirection = { x: bot.wanderX - bot.x, y: bot.wanderY - bot.y };
+  const boundaryDirection = {
+    x: bot.x < BOT_BOUNDARY_MARGIN ? 1 : bot.x > WORLD_WIDTH - BOT_BOUNDARY_MARGIN ? -1 : 0,
+    y: bot.y < BOT_BOUNDARY_MARGIN ? 1 : bot.y > WORLD_HEIGHT - BOT_BOUNDARY_MARGIN ? -1 : 0
+  };
+  return normalizeDirection(addDirection(wanderDirection, boundaryDirection, BOT_BOUNDARY_MARGIN));
+}
+
+function grantDeveloperMass() {
+  player.mass += 100;
+  updateRadiusFromMass(player);
 }
 
 function updateBots(dt, now) {
@@ -468,6 +530,8 @@ window.addEventListener('keydown', (event) => {
     splitPlayer();
   } else if (event.key && event.key.toLowerCase() === 'w') {
     ejectPlayerMass();
+  } else if (event.key && event.key.toLowerCase() === 'x') {
+    grantDeveloperMass();
   }
 });
 

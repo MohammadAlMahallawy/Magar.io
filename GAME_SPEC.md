@@ -162,7 +162,7 @@ all blobs sharing an `ownerId` for the leaderboard, camera framing, and
 | 0 (done) | Canvas fills window, resizes cleanly, stable rAF loop, test circle renders. |
 | 1 (done) | Player moves smoothly toward mouse, slower at higher mass, camera pans, grid/boundary prove world/screen conversion is correct, player can't leave world bounds. |
 | 2 | Fixed food count maintained, player grows via `sqrt` radius formula on eating, food never spawns inside a blob. |
-| 3 | 10-15 bots visibly show all 4 states (seeking food, hunting, fleeing, going bored and wandering off) without jitter. |
+| 3 | 10-15 bots visibly show all 4 states (seeking food, hunting, fleeing, going bored and wandering off) without jitter, with difficulty-based target prediction and boundary-aware movement. |
 | 4 | Space splits into two co-controlled pieces sharing `ownerId`; pieces can't re-merge before `MERGE_COOLDOWN`; eject key spawns a decelerating mass blob that others can eat. |
 | 5 | Virus pops any bigger blob that touches it into 3-7 pieces; ejecting mass into a virus grows it and it fires along the ejection trajectory once `VIRUS_FIRE_THRESHOLD` is crossed. |
 | 6 | Zoom smoothly interpolates out as total owned mass grows (never snaps); camera frames all owned pieces post-split; leaderboard shows top 10 by summed `ownerId` mass, refreshed every ~250ms. |
