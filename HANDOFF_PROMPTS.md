@@ -157,10 +157,12 @@ Add:
 - Blobs sharing an ownerId must never eat each other, and should visually
   move "together" (each still follows the same mouse-direction input
   independently, which is how agar.io actually feels).
-- Merging: if two blobs share an ownerId, are both past their
-  mergeLockUntil, and their distance < sum of radii (or some reasonable
-  overlap threshold), combine them into one blob (sum mass, recompute
-  radius, average position) and remove the duplicate.
+- Merging: blobs sharing an ownerId must automatically merge once they are
+  past their mergeLockUntil and overlap (distance < sum of radii). Resolve
+  connected clusters, not just pairs, so any number of nearby pieces can
+  combine into one blob in the same update. The result sums all mass,
+  recomputes radius, uses a mass-weighted average position, and removes the
+  duplicate blobs.
 - Eject key (use 'w'): if mass > EJECT_MASS_COST + some safety margin,
   subtract EJECT_MASS_COST from the ejecting blob's mass (recompute radius),
   spawn an ejectedMass object ({x,y,vx,vy,mass:EJECTED_MASS_MASS,radius,

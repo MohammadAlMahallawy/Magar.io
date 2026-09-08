@@ -55,7 +55,7 @@ const GRID_SIZE = 50;
 // Movement / mass-to-radius
 const BASE_SPEED = 260;        // px/sec at REFERENCE_MASS
 const REFERENCE_MASS = 20;
-const SPEED_FALLOFF = 0.45;    // speed = BASE_SPEED * (REFERENCE_MASS/mass)^SPEED_FALLOFF
+const SPEED_FALLOFF = 0.25;    // speed = BASE_SPEED * (REFERENCE_MASS/mass)^SPEED_FALLOFF
 const MASS_RADIUS_SCALE = 6;   // radius = sqrt(mass/PI) * MASS_RADIUS_SCALE
 const START_MASS = 20;
 

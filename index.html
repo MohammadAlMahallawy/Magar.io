@@ -31,7 +31,7 @@ const WORLD_HEIGHT = 5000;
 const GRID_SIZE = 50;
 const BASE_SPEED = 260;        // px/sec at REFERENCE_MASS
 const REFERENCE_MASS = 20;     // mass at which BASE_SPEED applies
-const SPEED_FALLOFF = 0.45;    // higher = bigger blobs slow down faster
+const SPEED_FALLOFF = 0.25;    // gentler slowdown keeps large blobs competitive
 const MASS_RADIUS_SCALE = 6;   // radius = sqrt(mass/PI) * this
 const START_MASS = 20;
 const FOOD_COUNT = 500;
@@ -48,8 +48,7 @@ const BOT_BORED_COOLDOWN = [10, 20];
 const SPLIT_MIN_MASS = 40;
 const SPLIT_KICK_SPEED = 500;
 const SPLIT_KICK_DECAY = 3.0;
-const SPLIT_MERGE_DELAY = 90;       // seconds before a split lineage recombines
-const MERGE_APPROACH_WINDOW = 5;    // final seconds allow pieces to overlap/merge
+const MERGE_COOLDOWN = 15;       // seconds before split pieces can merge again
 const EJECT_MASS_COST = 14;
 const EJECTED_MASS_MASS = 12;
 const EJECTED_MASS_SPEED = 700;
@@ -89,9 +88,7 @@ const player = {
 const playerBlobs = [player];
 const bots = [];
 const ejectedMass = [];
-const mergeGroups = [];
 let nextBlobId = 1;
-let nextMergeGroupId = 1;
 let gameTime = 0;
 
 function updateRadiusFromMass(obj) {
@@ -110,27 +107,6 @@ function getTotalMass(ownerId) {
     if (blob.ownerId === ownerId) total += blob.mass;
   }
   return total;
-}
-
-function createMergeGroup(memberIds, parentGroupId, now) {
-  const group = {
-    id: nextMergeGroupId++,
-    memberIds: memberIds.slice(),
-    parentGroupId,
-    mergeAt: now + SPLIT_MERGE_DELAY
-  };
-  mergeGroups.push(group);
-  return group;
-}
-
-function replaceGroupMembers(fromIds, replacementId) {
-  for (const group of mergeGroups) {
-    if (group.memberIds.some((id) => fromIds.includes(id))) {
-      group.memberIds = group.memberIds
-        .filter((id) => !fromIds.includes(id));
-      if (!group.memberIds.includes(replacementId)) group.memberIds.push(replacementId);
-    }
-  }
 }
 
 function randomRange(min, max) {
@@ -430,9 +406,9 @@ function splitBlob(blob, direction, now) {
   if (blob.mass < SPLIT_MIN_MASS) return null;
   if (blob.ownerId == null) blob.ownerId = blob.isBot ? blob.id : 'player';
 
-  const parentGroup = mergeGroups.find((group) => group.memberIds.includes(blob.id)) || null;
   const halfMass = blob.mass / 2;
   blob.mass = halfMass;
+  blob.mergeLockUntil = now + MERGE_COOLDOWN;
   updateRadiusFromMass(blob);
 
   const child = {
@@ -446,16 +422,11 @@ function splitBlob(blob, direction, now) {
     borderColor: blob.borderColor,
     vx: direction.x * SPLIT_KICK_SPEED,
     vy: direction.y * SPLIT_KICK_SPEED,
-    isBot: blob.isBot
+    isBot: blob.isBot,
+    mergeLockUntil: now + MERGE_COOLDOWN
   };
   updateRadiusFromMass(child);
   clampBlobToWorld(child);
-  if (parentGroup && !parentGroup.memberIds.includes(child.id)) {
-    parentGroup.memberIds.push(child.id);
-  }
-  const mergeGroup = createMergeGroup([blob.id, child.id], parentGroup ? parentGroup.id : null, now);
-  blob.mergeGroupId = mergeGroup.id;
-  child.mergeGroupId = mergeGroup.id;
   return child;
 }
 
@@ -540,41 +511,38 @@ function mergeBlobs(first, second) {
   first.mass = totalMass;
   first.vx = 0;
   first.vy = 0;
+  first.mergeLockUntil = 0;
   updateRadiusFromMass(first);
-  replaceGroupMembers([first.id, second.id], first.id);
   removeBlob(second);
 }
 
 function resolveMergeGroups() {
-  let merged;
-  do {
-    merged = false;
-    for (let i = mergeGroups.length - 1; i >= 0; i--) {
-      const group = mergeGroups[i];
-      const members = group.memberIds
-        .map((id) => findBlobById(id))
-        .filter((blob) => blob !== null);
-      group.memberIds = members.map((blob) => blob.id);
-      if (members.length !== 2) continue;
+  const eligible = activeBlobs().filter((blob) => gameTime >= blob.mergeLockUntil);
+  const visited = new Set();
 
-      const first = members[0];
-      const second = members[1];
-      const distance = Math.hypot(first.x - second.x, first.y - second.y);
-      if (gameTime >= group.mergeAt - MERGE_APPROACH_WINDOW) {
-        const pull = Math.min(1, 0.8 * (1 / 60));
-        first.x += (second.x - first.x) * pull;
-        first.y += (second.y - first.y) * pull;
-        second.x += (first.x - second.x) * pull;
-        second.y += (first.y - second.y) * pull;
-      }
-      if (gameTime >= group.mergeAt ||
-          (distance < first.radius + second.radius && gameTime >= group.mergeAt - MERGE_APPROACH_WINDOW)) {
-        mergeBlobs(first, second);
-        mergeGroups.splice(i, 1);
-        merged = true;
+  for (const start of eligible) {
+    if (visited.has(start.id)) continue;
+
+    const cluster = [];
+    const queue = [start];
+    visited.add(start.id);
+    while (queue.length > 0) {
+      const current = queue.shift();
+      cluster.push(current);
+      for (const candidate of eligible) {
+        if (visited.has(candidate.id) || candidate.ownerId !== start.ownerId) continue;
+        const distance = Math.hypot(current.x - candidate.x, current.y - candidate.y);
+        if (distance < current.radius + candidate.radius) {
+          visited.add(candidate.id);
+          queue.push(candidate);
+        }
       }
     }
-  } while (merged);
+
+    for (let i = 1; i < cluster.length; i++) {
+      mergeBlobs(cluster[0], cluster[i]);
+    }
+  }
 }
 
 function resolveBlobCollisions() {
@@ -588,10 +556,7 @@ function resolveBlobCollisions() {
       if (!activeBlobs().includes(second)) continue;
       const distance = Math.hypot(first.x - second.x, first.y - second.y);
       if (first.ownerId === second.ownerId) {
-        const mergeGroup = mergeGroups.find((group) =>
-          group.memberIds.includes(first.id) && group.memberIds.includes(second.id)
-        );
-        if (mergeGroup && gameTime >= mergeGroup.mergeAt - MERGE_APPROACH_WINDOW) continue;
+        if (gameTime >= first.mergeLockUntil && gameTime >= second.mergeLockUntil) continue;
         if (distance < first.radius + second.radius) {
           const minimumDistance = first.radius + second.radius;
           const separation = Math.max(0.001, minimumDistance - distance);
