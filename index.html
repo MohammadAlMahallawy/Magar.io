@@ -12,17 +12,25 @@
     background: rgba(255,255,255,0.75); padding: 6px 10px; border-radius: 4px;
     pointer-events: none;
   }
+  #leaderboard {
+    position: fixed; top: 10px; right: 10px; min-width: 170px;
+    color: #fff; background: rgba(0,0,0,0.5); padding: 10px 12px;
+    border-radius: 5px; font: 14px/1.35 Arial, sans-serif;
+    pointer-events: none; user-select: none;
+  }
+  #leaderboard h3 { margin: 0 0 5px; font-size: 16px; }
+  #leaderboard ol { margin: 0; padding-left: 22px; }
+  #leaderboard li { white-space: nowrap; }
 </style>
 </head>
 <body>
 <canvas id="gameCanvas"></canvas>
 <div id="hud">FPS: <span id="fps">0</span> | Mass: <span id="massDisplay">20</span></div>
+<div id="leaderboard"><h3>Leaderboard</h3><ol id="leaderboardList"></ol></div>
 <script>
 // ============================================================
-// PHASE 0 + PHASE 1 REFERENCE IMPLEMENTATION
-// Skeleton + World/Camera/Movement. Everything after this
-// point (food, bots, split, viruses, zoom/leaderboard) is
-// built by extending this same file, phase by phase.
+// PHASES 0-6 REFERENCE IMPLEMENTATION
+// The complete game stays in this file so it can run directly from disk.
 // ============================================================
 
 // ---------- Global constants (single source of truth) ----------
@@ -31,7 +39,7 @@ const WORLD_HEIGHT = 5000;
 const GRID_SIZE = 50;
 const BASE_SPEED = 260;        // px/sec at REFERENCE_MASS
 const REFERENCE_MASS = 20;     // mass at which BASE_SPEED applies
-const SPEED_FALLOFF = 0.45;    // higher = bigger blobs slow down faster
+const SPEED_FALLOFF = 0.25;    // gentler slowdown keeps large blobs competitive
 const MASS_RADIUS_SCALE = 6;   // radius = sqrt(mass/PI) * this
 const START_MASS = 20;
 const FOOD_COUNT = 500;
@@ -45,15 +53,38 @@ const BOT_EAT_MARGIN = 1.25;
 const BOT_REEVAL_INTERVAL = { easy: 1.0, medium: 0.5, hard: 0.2 };
 const BOT_BORED_AFTER = [8, 15];
 const BOT_BORED_COOLDOWN = [10, 20];
+const BOT_PREDICTION_TIME = { easy: 0.15, medium: 0.35, hard: 0.65 };
+const BOT_BOUNDARY_MARGIN = 180;
+const BOT_RESPAWN_DELAY = [3, 7];
+const BOT_MASS_RANGES = {
+  easy: [14, 34],
+  medium: [24, 58],
+  hard: [38, 86]
+};
 const SPLIT_MIN_MASS = 40;
 const SPLIT_KICK_SPEED = 500;
 const SPLIT_KICK_DECAY = 3.0;
-const SPLIT_MERGE_DELAY = 90;       // seconds before a split lineage recombines
-const MERGE_APPROACH_WINDOW = 5;    // final seconds allow pieces to overlap/merge
+const MERGE_COOLDOWN = 15;       // seconds before split pieces can merge again
 const EJECT_MASS_COST = 14;
 const EJECTED_MASS_MASS = 12;
 const EJECTED_MASS_SPEED = 700;
 const EJECTED_MASS_DECAY = 4.0;
+const VIRUS_COUNT = 0;
+const VIRUS_BASE_MASS = 100;
+const VIRUS_SPIKES = 12;
+const VIRUS_FIRE_THRESHOLD = 150;
+const VIRUS_FIRE_DISTANCE = 800;
+const VIRUS_POP_MIN_PIECES = 3;
+const VIRUS_POP_MAX_PIECES = 7;
+const VIRUS_RESPAWN_DELAY = 1.5;
+const BASE_ZOOM = 1.0;
+const BASE_ZOOM_MASS = START_MASS;
+const MIN_ZOOM = 0.12;
+const MAX_ZOOM = 1.0;
+const ZOOM_LERP = 0.05;
+const CAMERA_FRAME_PADDING = 1.25;
+const LEADERBOARD_SIZE = 10;
+const LEADERBOARD_REFRESH_MS = 250;
 
 // ---------- Canvas setup ----------
 const canvas = document.getElementById('gameCanvas');
@@ -88,11 +119,12 @@ const player = {
 };
 const playerBlobs = [player];
 const bots = [];
+const botRespawns = [];
 const ejectedMass = [];
-const mergeGroups = [];
+const viruses = [];
 let nextBlobId = 1;
-let nextMergeGroupId = 1;
 let gameTime = 0;
+let playerRespawnAt = 0;
 
 function updateRadiusFromMass(obj) {
   // Area scales with mass, not radius directly -> sqrt.
@@ -110,27 +142,6 @@ function getTotalMass(ownerId) {
     if (blob.ownerId === ownerId) total += blob.mass;
   }
   return total;
-}
-
-function createMergeGroup(memberIds, parentGroupId, now) {
-  const group = {
-    id: nextMergeGroupId++,
-    memberIds: memberIds.slice(),
-    parentGroupId,
-    mergeAt: now + SPLIT_MERGE_DELAY
-  };
-  mergeGroups.push(group);
-  return group;
-}
-
-function replaceGroupMembers(fromIds, replacementId) {
-  for (const group of mergeGroups) {
-    if (group.memberIds.some((id) => fromIds.includes(id))) {
-      group.memberIds = group.memberIds
-        .filter((id) => !fromIds.includes(id));
-      if (!group.memberIds.includes(replacementId)) group.memberIds.push(replacementId);
-    }
-  }
 }
 
 function randomRange(min, max) {
@@ -155,11 +166,44 @@ function randomSpawnPosition(radius) {
   };
 }
 
-function createBot(index) {
-  const difficulty = randomBotDifficulty();
-  const mass = randomRange(14, 42);
+function isSafeSpawn(position, radius, includeViruses) {
+  if (!activeBlobs().every((blob) =>
+      Math.hypot(position.x - blob.x, position.y - blob.y) >= radius + blob.radius + 100)) {
+    return false;
+  }
+  if (includeViruses && !viruses.every((virus) =>
+      !virus.active || Math.hypot(position.x - virus.x, position.y - virus.y) >= radius + virus.radius + 80)) {
+    return false;
+  }
+  return true;
+}
+
+function findSafeSpawnPosition(radius, includeViruses) {
+  let position = randomSpawnPosition(radius);
+  for (let attempt = 0; attempt < 120; attempt++) {
+    position = randomSpawnPosition(radius);
+    if (isSafeSpawn(position, radius, includeViruses)) return position;
+  }
+
+  // The normal random path is sufficient in this large world. The scan makes
+  // respawning deterministic and safe when a crowded test setup fills it.
+  const step = Math.max(100, radius * 2 + 100);
+  for (let y = radius; y <= WORLD_HEIGHT - radius; y += step) {
+    for (let x = radius; x <= WORLD_WIDTH - radius; x += step) {
+      position = { x, y };
+      if (isSafeSpawn(position, radius, includeViruses)) return position;
+    }
+  }
+  return position;
+}
+
+function createBot(index, difficultyOverride) {
+  const difficulty = difficultyOverride || randomBotDifficulty();
+  const massRange = BOT_MASS_RANGES[difficulty];
+  const mass = randomRange(massRange[0], massRange[1]);
   const bot = {
     id: 'bot_' + index,
+    botSlot: index,
     ownerId: 'bot_' + index,
     x: 0,
     y: 0,
@@ -181,19 +225,14 @@ function createBot(index) {
     boredAfter: randomDuration(BOT_BORED_AFTER),
     wanderX: 0,
     wanderY: 0,
+    targetX: 0,
+    targetY: 0,
     canSplit: difficulty !== 'easy',
     canEject: difficulty !== 'easy'
   };
   updateRadiusFromMass(bot);
 
-  let position = randomSpawnPosition(bot.radius);
-  for (let attempt = 0; attempt < 40; attempt++) {
-    const tooClose = activeBlobs().some((blob) =>
-      Math.hypot(position.x - blob.x, position.y - blob.y) < bot.radius + blob.radius + 100
-    );
-    if (!tooClose) break;
-    position = randomSpawnPosition(bot.radius);
-  }
+  const position = findSafeSpawnPosition(bot.radius, false);
   bot.x = position.x;
   bot.y = position.y;
   bot.wanderX = bot.x;
@@ -238,6 +277,44 @@ for (let i = 0; i < FOOD_COUNT; i++) {
   spawnFood();
 }
 
+// ---------- Viruses ----------
+function createVirus(index) {
+  const virus = {
+    id: 'virus_' + index,
+    x: 0,
+    y: 0,
+    mass: VIRUS_BASE_MASS,
+    radius: 0,
+    vx: 0,
+    vy: 0,
+    active: true,
+    firing: false,
+    travelRemaining: 0,
+    respawnAt: 0
+  };
+  updateRadiusFromMass(virus);
+  const position = findSafeSpawnPosition(virus.radius, true);
+  virus.x = position.x;
+  virus.y = position.y;
+  return virus;
+}
+
+function resetVirus(virus, position) {
+  virus.x = position.x;
+  virus.y = position.y;
+  virus.mass = VIRUS_BASE_MASS;
+  updateRadiusFromMass(virus);
+  virus.vx = 0;
+  virus.vy = 0;
+  virus.firing = false;
+  virus.travelRemaining = 0;
+  virus.active = true;
+}
+
+for (let i = 0; i < VIRUS_COUNT; i++) {
+  viruses.push(createVirus(i + 1));
+}
+
 function updateFood() {
   for (let i = food.length - 1; i >= 0; i--) {
     const item = food[i];
@@ -263,7 +340,7 @@ window.addEventListener('mousemove', (e) => {
 // ---------- Camera ----------
 // camera.x / camera.y are WORLD coordinates of whatever is at
 // the center of the screen. camera.zoom is a scale factor.
-const camera = { x: player.x, y: player.y, zoom: 1 };
+const camera = { x: player.x, y: player.y, zoom: BASE_ZOOM };
 
 // THE single conversion function. Every draw call must go through this.
 function worldToScreen(wx, wy) {
@@ -310,14 +387,87 @@ function moveBlob(blob, direction, dt) {
   clampBlobToWorld(blob);
 }
 
-function updatePlayer(dt) {
-  for (const blob of playerBlobs) {
-    moveBlob(blob, playerDirection(blob), dt);
+function createPlayerBlob() {
+  const spawn = findSafeSpawnPosition(Math.sqrt(START_MASS / Math.PI) * MASS_RADIUS_SCALE, false);
+  const blob = {
+    id: 'player_piece_' + (nextBlobId++),
+    ownerId: player.ownerId,
+    x: spawn.x,
+    y: spawn.y,
+    mass: START_MASS,
+    radius: 0,
+    color: player.color,
+    borderColor: player.borderColor,
+    vx: 0,
+    vy: 0,
+    mergeLockUntil: 0,
+    isBot: false
+  };
+  updateRadiusFromMass(blob);
+  return blob;
+}
+
+function ownedPlayerBlobs() {
+  return playerBlobs.filter((blob) => blob.ownerId === player.ownerId);
+}
+
+function updateCamera(dt) {
+  const owned = ownedPlayerBlobs();
+  if (owned.length === 0) {
+    if (gameTime >= playerRespawnAt) {
+      playerBlobs.push(createPlayerBlob());
+      playerRespawnAt = 0;
+    }
+    return;
   }
 
-  const focus = playerBlobs[0] || player;
-  camera.x = focus.x;
-  camera.y = focus.y;
+  let centerX = 0;
+  let centerY = 0;
+  let boundsMinX = Infinity;
+  let boundsMaxX = -Infinity;
+  let boundsMinY = Infinity;
+  let boundsMaxY = -Infinity;
+  for (const blob of owned) {
+    centerX += blob.x;
+    centerY += blob.y;
+    boundsMinX = Math.min(boundsMinX, blob.x - blob.radius);
+    boundsMaxX = Math.max(boundsMaxX, blob.x + blob.radius);
+    boundsMinY = Math.min(boundsMinY, blob.y - blob.radius);
+    boundsMaxY = Math.max(boundsMaxY, blob.y + blob.radius);
+  }
+  centerX /= owned.length;
+  centerY /= owned.length;
+
+  const totalMass = Math.max(1, getTotalMass(player.ownerId));
+  const massZoom = BASE_ZOOM / Math.pow(totalMass / BASE_ZOOM_MASS, 0.45);
+  const frameWidth = Math.max(1, (boundsMaxX - boundsMinX) * CAMERA_FRAME_PADDING);
+  const frameHeight = Math.max(1, (boundsMaxY - boundsMinY) * CAMERA_FRAME_PADDING);
+  const spreadZoom = Math.min(canvas.width / frameWidth, canvas.height / frameHeight);
+  const targetZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, massZoom, spreadZoom));
+  camera.zoom += (targetZoom - camera.zoom) * (1 - Math.pow(1 - ZOOM_LERP, Math.max(1, dt * 60)));
+
+  const worldHalfWidth = canvas.width / (2 * camera.zoom);
+  const worldHalfHeight = canvas.height / (2 * camera.zoom);
+  const minX = worldHalfWidth;
+  const maxX = WORLD_WIDTH - worldHalfWidth;
+  const minY = worldHalfHeight;
+  const maxY = WORLD_HEIGHT - worldHalfHeight;
+  const targetX = minX > maxX ? WORLD_WIDTH / 2 : Math.max(minX, Math.min(maxX, centerX));
+  const targetY = minY > maxY ? WORLD_HEIGHT / 2 : Math.max(minY, Math.min(maxY, centerY));
+  camera.x += (targetX - camera.x) * 0.15;
+  camera.y += (targetY - camera.y) * 0.15;
+}
+
+function updatePlayer(dt) {
+  if (playerBlobs.length === 0) {
+    if (!playerRespawnAt) playerRespawnAt = gameTime + 2;
+    updateCamera(dt);
+    return;
+  }
+  for (const blob of playerBlobs) {
+    if (blob.ownerId === player.ownerId) moveBlob(blob, playerDirection(blob), dt);
+  }
+  updateCamera(dt);
 }
 
 function findBlobById(id) {
@@ -343,12 +493,19 @@ function reevaluateBot(bot, now) {
   bot.nextEvalAt = now + BOT_REEVAL_INTERVAL[bot.difficulty];
 
   const nearby = blobsNear(bot);
-  const threat = nearby
+  const threats = nearby
     .filter((blob) => blob.mass > bot.mass * BOT_EAT_MARGIN)
-    .sort((a, b) => Math.hypot(a.x - bot.x, a.y - bot.y) - Math.hypot(b.x - bot.x, b.y - bot.y))[0];
+    .sort((a, b) => {
+      const distanceA = Math.hypot(a.x - bot.x, a.y - bot.y);
+      const distanceB = Math.hypot(b.x - bot.x, b.y - bot.y);
+      return (distanceA / a.mass) - (distanceB / b.mass);
+    });
+  const threat = threats[0];
   if (threat) {
     bot.state = 'FLEEING';
     bot.targetId = threat.id;
+    bot.targetX = threat.x;
+    bot.targetY = threat.y;
     return;
   }
 
@@ -375,7 +532,13 @@ function reevaluateBot(bot, now) {
       blob.id !== blockedTargetId &&
       blob.mass < bot.mass / BOT_EAT_MARGIN
     )
-    .sort((a, b) => b.mass - a.mass)[0];
+    .sort((a, b) => {
+      const score = (blob) => {
+        const distance = Math.hypot(blob.x - bot.x, blob.y - bot.y);
+        return blob.mass / Math.max(100, distance);
+      };
+      return score(b) - score(a);
+    })[0];
   if (prey) {
     if (bot.targetId !== prey.id) {
       bot.huntStartedAt = now;
@@ -383,43 +546,105 @@ function reevaluateBot(bot, now) {
     }
     bot.state = 'HUNTING';
     bot.targetId = prey.id;
+    bot.targetX = prey.x;
+    bot.targetY = prey.y;
   } else {
     bot.state = now < bot.boredUntil ? 'BORED' : 'SEEKING_FOOD';
     bot.targetId = null;
+    bot.targetX = 0;
+    bot.targetY = 0;
   }
+}
+
+function addDirection(first, second, weight) {
+  return {
+    x: first.x + second.x * weight,
+    y: first.y + second.y * weight
+  };
+}
+
+function normalizeDirection(direction) {
+  const length = Math.hypot(direction.x, direction.y);
+  return length > 0.001 ? { x: direction.x / length, y: direction.y / length } : { x: 0, y: 0 };
 }
 
 function botDirection(bot) {
   const target = bot.targetId ? findBlobById(bot.targetId) : null;
   if (bot.state === 'FLEEING' && target) {
-    const distance = Math.hypot(bot.x - target.x, bot.y - target.y) || 1;
-    return { x: (bot.x - target.x) / distance, y: (bot.y - target.y) / distance };
+    const threatDirection = normalizeDirection({ x: bot.x - target.x, y: bot.y - target.y });
+    const boundaryDirection = {
+      x: bot.x < BOT_BOUNDARY_MARGIN ? 1 : bot.x > WORLD_WIDTH - BOT_BOUNDARY_MARGIN ? -1 : 0,
+      y: bot.y < BOT_BOUNDARY_MARGIN ? 1 : bot.y > WORLD_HEIGHT - BOT_BOUNDARY_MARGIN ? -1 : 0
+    };
+    return normalizeDirection(addDirection(threatDirection, boundaryDirection, 2));
   }
   if (bot.state === 'HUNTING' && target) {
-    const distance = Math.hypot(target.x - bot.x, target.y - bot.y) || 1;
-    return { x: (target.x - bot.x) / distance, y: (target.y - bot.y) / distance };
+    const prediction = BOT_PREDICTION_TIME[bot.difficulty];
+    const predictedTarget = {
+      x: target.x + target.vx * prediction,
+      y: target.y + target.vy * prediction
+    };
+    bot.targetX = predictedTarget.x;
+    bot.targetY = predictedTarget.y;
+    return normalizeDirection({ x: predictedTarget.x - bot.x, y: predictedTarget.y - bot.y });
   }
 
   let nearestFood = null;
-  let nearestDistance = BOT_DETECTION_RADIUS;
+  let bestFoodScore = -Infinity;
   for (const item of food) {
     const distance = Math.hypot(item.x - bot.x, item.y - bot.y);
-    if (distance < nearestDistance) {
-      nearestFood = item;
-      nearestDistance = distance;
+    if (distance <= BOT_DETECTION_RADIUS) {
+      const score = (BOT_DETECTION_RADIUS - distance) / BOT_DETECTION_RADIUS;
+      if (score > bestFoodScore) {
+        bestFoodScore = score;
+        nearestFood = item;
+      }
     }
   }
   if (nearestFood) {
-    const distance = Math.max(1, nearestDistance);
-    return { x: (nearestFood.x - bot.x) / distance, y: (nearestFood.y - bot.y) / distance };
+    const boundaryDirection = {
+      x: bot.x < BOT_BOUNDARY_MARGIN ? 1 : bot.x > WORLD_WIDTH - BOT_BOUNDARY_MARGIN ? -1 : 0,
+      y: bot.y < BOT_BOUNDARY_MARGIN ? 1 : bot.y > WORLD_HEIGHT - BOT_BOUNDARY_MARGIN ? -1 : 0
+    };
+    return normalizeDirection(addDirection(
+      { x: nearestFood.x - bot.x, y: nearestFood.y - bot.y },
+      boundaryDirection,
+      BOT_BOUNDARY_MARGIN
+    ));
   }
 
   if (Math.hypot(bot.wanderX - bot.x, bot.wanderY - bot.y) < 20) chooseWanderPoint(bot);
-  const distance = Math.max(1, Math.hypot(bot.wanderX - bot.x, bot.wanderY - bot.y));
-  return { x: (bot.wanderX - bot.x) / distance, y: (bot.wanderY - bot.y) / distance };
+  const wanderDirection = { x: bot.wanderX - bot.x, y: bot.wanderY - bot.y };
+  const boundaryDirection = {
+    x: bot.x < BOT_BOUNDARY_MARGIN ? 1 : bot.x > WORLD_WIDTH - BOT_BOUNDARY_MARGIN ? -1 : 0,
+    y: bot.y < BOT_BOUNDARY_MARGIN ? 1 : bot.y > WORLD_HEIGHT - BOT_BOUNDARY_MARGIN ? -1 : 0
+  };
+  return normalizeDirection(addDirection(wanderDirection, boundaryDirection, BOT_BOUNDARY_MARGIN));
+}
+
+function grantDeveloperMass() {
+  const owned = ownedPlayerBlobs();
+  const totalMass = owned.reduce((sum, blob) => sum + blob.mass, 0);
+  if (totalMass > 0) {
+    for (const blob of owned) {
+      blob.mass += 1000 * (blob.mass / totalMass);
+      updateRadiusFromMass(blob);
+    }
+  } else if (!playerRespawnAt) {
+    player.mass += 1000;
+    updateRadiusFromMass(player);
+  }
 }
 
 function updateBots(dt, now) {
+  for (let i = botRespawns.length - 1; i >= 0; i--) {
+    const respawn = botRespawns[i];
+    if (now < respawn.respawnAt) continue;
+    if (!activeBlobs().some((blob) => blob.ownerId === 'bot_' + respawn.botSlot)) {
+      bots.push(createBot(respawn.botSlot));
+    }
+    botRespawns.splice(i, 1);
+  }
   for (const bot of bots) {
     reevaluateBot(bot, now);
     moveBlob(bot, botDirection(bot), dt);
@@ -430,33 +655,101 @@ function splitBlob(blob, direction, now) {
   if (blob.mass < SPLIT_MIN_MASS) return null;
   if (blob.ownerId == null) blob.ownerId = blob.isBot ? blob.id : 'player';
 
-  const parentGroup = mergeGroups.find((group) => group.memberIds.includes(blob.id)) || null;
   const halfMass = blob.mass / 2;
   blob.mass = halfMass;
+  blob.mergeLockUntil = now + MERGE_COOLDOWN;
   updateRadiusFromMass(blob);
 
   const child = {
     id: (blob.isBot ? blob.ownerId : 'player') + '_piece_' + (nextBlobId++),
     ownerId: blob.ownerId,
-    x: blob.x + direction.x * (blob.radius + halfMass),
-    y: blob.y + direction.y * (blob.radius + halfMass),
+    x: blob.x,
+    y: blob.y,
     mass: halfMass,
     radius: 0,
     color: blob.color,
     borderColor: blob.borderColor,
     vx: direction.x * SPLIT_KICK_SPEED,
     vy: direction.y * SPLIT_KICK_SPEED,
-    isBot: blob.isBot
+    isBot: blob.isBot,
+    mergeLockUntil: now + MERGE_COOLDOWN,
+    state: blob.state,
+    difficulty: blob.difficulty,
+    targetId: null,
+    nextEvalAt: now,
+    boredUntil: blob.boredUntil || 0,
+    boredTargetId: blob.boredTargetId || null,
+    huntStartedAt: now,
+    boredAfter: blob.boredAfter || randomDuration(BOT_BORED_AFTER),
+    wanderX: blob.wanderX || blob.x,
+    wanderY: blob.wanderY || blob.y,
+    targetX: 0,
+    targetY: 0,
+    canSplit: blob.canSplit,
+    canEject: blob.canEject,
+    botSlot: blob.botSlot
   };
   updateRadiusFromMass(child);
+  child.x += direction.x * (blob.radius + child.radius + 2);
+  child.y += direction.y * (blob.radius + child.radius + 2);
   clampBlobToWorld(child);
-  if (parentGroup && !parentGroup.memberIds.includes(child.id)) {
-    parentGroup.memberIds.push(child.id);
-  }
-  const mergeGroup = createMergeGroup([blob.id, child.id], parentGroup ? parentGroup.id : null, now);
-  blob.mergeGroupId = mergeGroup.id;
-  child.mergeGroupId = mergeGroup.id;
   return child;
+}
+
+function createVirusPiece(blob, mass, direction, now, index) {
+  const radius = Math.sqrt(mass / Math.PI) * MASS_RADIUS_SCALE;
+  const piece = {
+    id: blob.ownerId + '_virus_piece_' + (nextBlobId++) + '_' + index,
+    ownerId: blob.ownerId,
+    x: blob.x + direction.x * (blob.radius + radius + 2),
+    y: blob.y + direction.y * (blob.radius + radius + 2),
+    mass,
+    radius,
+    color: blob.color,
+    borderColor: blob.borderColor,
+    vx: direction.x * SPLIT_KICK_SPEED,
+    vy: direction.y * SPLIT_KICK_SPEED,
+    mergeLockUntil: now + MERGE_COOLDOWN,
+    isBot: blob.isBot
+  };
+  if (blob.isBot) {
+    piece.botSlot = blob.botSlot;
+    piece.state = 'SEEKING_FOOD';
+    piece.difficulty = blob.difficulty || 'easy';
+    piece.targetId = null;
+    piece.nextEvalAt = now;
+    piece.boredUntil = 0;
+    piece.boredTargetId = null;
+    piece.huntStartedAt = now;
+    piece.boredAfter = randomDuration(BOT_BORED_AFTER);
+    piece.wanderX = piece.x;
+    piece.wanderY = piece.y;
+    piece.targetX = 0;
+    piece.targetY = 0;
+    piece.canSplit = blob.canSplit;
+    piece.canEject = blob.canEject;
+  }
+  clampBlobToWorld(piece);
+  return piece;
+}
+
+function popBlobWithVirus(blob, virus, now) {
+  if (!blob || blob.mass <= virus.mass) return false;
+  const ratio = blob.mass / Math.max(1, virus.mass);
+  const pieceCount = Math.max(
+    VIRUS_POP_MIN_PIECES,
+    Math.min(VIRUS_POP_MAX_PIECES, VIRUS_POP_MIN_PIECES + Math.floor(ratio - 1))
+  );
+  const pieceMass = blob.mass / pieceCount;
+  const collection = blob.isBot ? bots : playerBlobs;
+  const index = collection.indexOf(blob);
+  if (index < 0) return false;
+  collection.splice(index, 1);
+  for (let i = 0; i < pieceCount; i++) {
+    const angle = (Math.PI * 2 * i) / pieceCount + Math.random() * 0.35;
+    collection.push(createVirusPiece(blob, pieceMass, { x: Math.cos(angle), y: Math.sin(angle) }, now, i));
+  }
+  return true;
 }
 
 function splitPlayer() {
@@ -497,6 +790,8 @@ window.addEventListener('keydown', (event) => {
     splitPlayer();
   } else if (event.key && event.key.toLowerCase() === 'w') {
     ejectPlayerMass();
+  } else if (event.key && event.key.toLowerCase() === 'x') {
+    grantDeveloperMass();
   }
 });
 
@@ -509,6 +804,80 @@ function updateEjectedMass(dt) {
     item.vy *= decay;
     item.x = Math.max(item.radius, Math.min(WORLD_WIDTH - item.radius, item.x));
     item.y = Math.max(item.radius, Math.min(WORLD_HEIGHT - item.radius, item.y));
+  }
+}
+
+function startVirusFlight(virus, vx, vy) {
+  const length = Math.hypot(vx, vy);
+  const direction = length > 0.001 ? { x: vx / length, y: vy / length } : { x: 1, y: 0 };
+  // With exponential deceleration, initial speed / decay is the travel
+  // distance. This keeps every fired virus on a predictable trajectory.
+  const speed = VIRUS_FIRE_DISTANCE * EJECTED_MASS_DECAY;
+  virus.vx = direction.x * speed;
+  virus.vy = direction.y * speed;
+  virus.travelRemaining = VIRUS_FIRE_DISTANCE;
+  virus.firing = true;
+}
+
+function updateViruses(dt, now) {
+  for (const virus of viruses) {
+    if (!virus.active) {
+      if (now >= virus.respawnAt) {
+        resetVirus(virus, findSafeSpawnPosition(virus.radius, true));
+      }
+      continue;
+    }
+    if (!virus.firing) continue;
+
+    const oldX = virus.x;
+    const oldY = virus.y;
+    virus.x += virus.vx * dt;
+    virus.y += virus.vy * dt;
+    clampBlobToWorld(virus);
+    virus.travelRemaining -= Math.hypot(virus.x - oldX, virus.y - oldY);
+    const decay = Math.max(0, 1 - EJECTED_MASS_DECAY * dt);
+    virus.vx *= decay;
+    virus.vy *= decay;
+    if (virus.travelRemaining <= 0 || Math.hypot(virus.vx, virus.vy) < 10) {
+      resetVirus(virus, { x: virus.x, y: virus.y });
+    }
+  }
+}
+
+function resolveVirusFeeding() {
+  for (let i = ejectedMass.length - 1; i >= 0; i--) {
+    const item = ejectedMass[i];
+    const virus = viruses.find((candidate) =>
+      candidate.active && !candidate.firing &&
+      Math.hypot(item.x - candidate.x, item.y - candidate.y) < item.radius + candidate.radius
+    );
+    if (!virus) continue;
+    const directionX = item.vx;
+    const directionY = item.vy;
+    virus.mass += item.mass;
+    updateRadiusFromMass(virus);
+    ejectedMass.splice(i, 1);
+    if (virus.mass >= VIRUS_FIRE_THRESHOLD) {
+      startVirusFlight(virus, directionX, directionY);
+    }
+  }
+}
+
+function resolveVirusBlobCollisions(now) {
+  for (const virus of viruses) {
+    if (!virus.active) continue;
+    const candidates = activeBlobs();
+    const blob = candidates.find((candidate) =>
+      candidate.mass > virus.mass &&
+      Math.hypot(candidate.x - virus.x, candidate.y - virus.y) < candidate.radius + virus.radius
+    );
+    if (!blob || !popBlobWithVirus(blob, virus, now)) continue;
+    virus.active = false;
+    virus.firing = false;
+    virus.vx = 0;
+    virus.vy = 0;
+    virus.travelRemaining = 0;
+    virus.respawnAt = now + VIRUS_RESPAWN_DELAY;
   }
 }
 
@@ -530,7 +899,15 @@ function resolveEjectedMass() {
 function removeBlob(blob) {
   const collection = blob.isBot ? bots : playerBlobs;
   const index = collection.indexOf(blob);
-  if (index !== -1) collection.splice(index, 1);
+  if (index === -1) return;
+  collection.splice(index, 1);
+  if (blob.isBot && !activeBlobs().some((candidate) => candidate.ownerId === blob.ownerId) &&
+      !botRespawns.some((respawn) => respawn.botSlot === blob.botSlot)) {
+    botRespawns.push({
+      botSlot: blob.botSlot,
+      respawnAt: gameTime + randomRange(BOT_RESPAWN_DELAY[0], BOT_RESPAWN_DELAY[1])
+    });
+  }
 }
 
 function mergeBlobs(first, second) {
@@ -540,41 +917,38 @@ function mergeBlobs(first, second) {
   first.mass = totalMass;
   first.vx = 0;
   first.vy = 0;
+  first.mergeLockUntil = 0;
   updateRadiusFromMass(first);
-  replaceGroupMembers([first.id, second.id], first.id);
   removeBlob(second);
 }
 
 function resolveMergeGroups() {
-  let merged;
-  do {
-    merged = false;
-    for (let i = mergeGroups.length - 1; i >= 0; i--) {
-      const group = mergeGroups[i];
-      const members = group.memberIds
-        .map((id) => findBlobById(id))
-        .filter((blob) => blob !== null);
-      group.memberIds = members.map((blob) => blob.id);
-      if (members.length !== 2) continue;
+  const eligible = activeBlobs().filter((blob) => gameTime >= blob.mergeLockUntil);
+  const visited = new Set();
 
-      const first = members[0];
-      const second = members[1];
-      const distance = Math.hypot(first.x - second.x, first.y - second.y);
-      if (gameTime >= group.mergeAt - MERGE_APPROACH_WINDOW) {
-        const pull = Math.min(1, 0.8 * (1 / 60));
-        first.x += (second.x - first.x) * pull;
-        first.y += (second.y - first.y) * pull;
-        second.x += (first.x - second.x) * pull;
-        second.y += (first.y - second.y) * pull;
-      }
-      if (gameTime >= group.mergeAt ||
-          (distance < first.radius + second.radius && gameTime >= group.mergeAt - MERGE_APPROACH_WINDOW)) {
-        mergeBlobs(first, second);
-        mergeGroups.splice(i, 1);
-        merged = true;
+  for (const start of eligible) {
+    if (visited.has(start.id)) continue;
+
+    const cluster = [];
+    const queue = [start];
+    visited.add(start.id);
+    while (queue.length > 0) {
+      const current = queue.shift();
+      cluster.push(current);
+      for (const candidate of eligible) {
+        if (visited.has(candidate.id) || candidate.ownerId !== start.ownerId) continue;
+        const distance = Math.hypot(current.x - candidate.x, current.y - candidate.y);
+        if (distance < current.radius + candidate.radius) {
+          visited.add(candidate.id);
+          queue.push(candidate);
+        }
       }
     }
-  } while (merged);
+
+    for (let i = 1; i < cluster.length; i++) {
+      mergeBlobs(cluster[0], cluster[i]);
+    }
+  }
 }
 
 function resolveBlobCollisions() {
@@ -588,10 +962,7 @@ function resolveBlobCollisions() {
       if (!activeBlobs().includes(second)) continue;
       const distance = Math.hypot(first.x - second.x, first.y - second.y);
       if (first.ownerId === second.ownerId) {
-        const mergeGroup = mergeGroups.find((group) =>
-          group.memberIds.includes(first.id) && group.memberIds.includes(second.id)
-        );
-        if (mergeGroup && gameTime >= mergeGroup.mergeAt - MERGE_APPROACH_WINDOW) continue;
+        if (gameTime >= first.mergeLockUntil && gameTime >= second.mergeLockUntil) continue;
         if (distance < first.radius + second.radius) {
           const minimumDistance = first.radius + second.radius;
           const separation = Math.max(0.001, minimumDistance - distance);
@@ -615,6 +986,7 @@ function resolveBlobCollisions() {
       larger.mass += smaller.mass;
       updateRadiusFromMass(larger);
       removeBlob(smaller);
+      if (smaller === first) break;
     }
   }
 }
@@ -704,6 +1076,29 @@ function drawEjectedMass() {
   }
 }
 
+function drawVirus(virus) {
+  if (!virus.active) return;
+  const s = worldToScreen(virus.x, virus.y);
+  const r = virus.radius * camera.zoom;
+  if (s.x + r * 1.3 < 0 || s.x - r * 1.3 > canvas.width ||
+      s.y + r * 1.3 < 0 || s.y - r * 1.3 > canvas.height) return;
+  ctx.beginPath();
+  for (let i = 0; i < VIRUS_SPIKES * 2; i++) {
+    const angle = (Math.PI * 2 * i) / (VIRUS_SPIKES * 2);
+    const pointRadius = (i % 2 === 0 ? r * 1.25 : r);
+    const x = s.x + Math.cos(angle) * pointRadius;
+    const y = s.y + Math.sin(angle) * pointRadius;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+  ctx.fillStyle = '#33ff33';
+  ctx.fill();
+  ctx.strokeStyle = '#168c2b';
+  ctx.lineWidth = Math.max(2, r * 0.08);
+  ctx.stroke();
+}
+
 function render() {
   ctx.fillStyle = '#f2f6fa';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -711,8 +1106,27 @@ function render() {
   drawWorldBoundary();
   drawFood();
   drawEjectedMass();
+  for (const virus of viruses) drawVirus(virus);
   for (const bot of bots) drawBlob(bot);
   for (const blob of playerBlobs) drawBlob(blob);
+}
+
+let nextLeaderboardAt = 0;
+function refreshLeaderboard() {
+  const totals = new Map();
+  for (const blob of activeBlobs()) {
+    totals.set(blob.ownerId, (totals.get(blob.ownerId) || 0) + blob.mass);
+  }
+  const standings = Array.from(totals.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, LEADERBOARD_SIZE);
+  const list = document.getElementById('leaderboardList');
+  list.textContent = '';
+  for (const [ownerId, mass] of standings) {
+    const item = document.createElement('li');
+    item.textContent = (ownerId === player.ownerId ? 'You' : ownerId) + ' — ' + Math.round(mass);
+    list.appendChild(item);
+  }
 }
 
 // ---------- Game loop (rAF + delta time, never setInterval) ----------
@@ -724,14 +1138,23 @@ const massEl = document.getElementById('massDisplay');
 function loop(now) {
   const dt = Math.min((now - lastTime) / 1000, 0.1); // clamp to avoid huge jumps on tab-switch
   lastTime = now;
+  gameTime += dt;
 
   updatePlayer(dt);
   updateBots(dt, gameTime);
+  updateViruses(dt, gameTime);
   updateFood();
   updateEjectedMass(dt);
+  resolveVirusFeeding();
   resolveEjectedMass();
+  resolveVirusBlobCollisions(gameTime);
   resolveBlobCollisions();
   render();
+
+  if (gameTime >= nextLeaderboardAt) {
+    refreshLeaderboard();
+    nextLeaderboardAt = gameTime + LEADERBOARD_REFRESH_MS / 1000;
+  }
 
   fpsAccumFrames++;
   fpsAccumTime += dt;
@@ -742,7 +1165,6 @@ function loop(now) {
     fpsAccumTime = 0;
   }
 
-  gameTime += dt;
   requestAnimationFrame(loop);
 }
 requestAnimationFrame(loop);

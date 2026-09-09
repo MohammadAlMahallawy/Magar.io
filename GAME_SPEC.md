@@ -4,10 +4,10 @@ This is the single source of truth to paste/attach alongside every phase prompt
 given to the builder model. It exists so numbers and rules don't drift between
 sessions with a model that has no memory of earlier conversations.
 
-**Status:** Phase 0 and Phase 1 are already implemented in `index.html`
-(skeleton, resize handling, rAF game loop with delta time, world/camera
-system, player movement, grid + boundary rendering). Everything from Phase 2
-onward is built by *extending that same file*, phase by phase.
+**Status:** Phases 0 through 6 are implemented in `index.html` (single-file
+skeleton, food, bots, split/eject, viruses, camera framing/zoom, and a
+throttled leaderboard). This document remains the source of truth for the
+constants and acceptance details.
 
 ---
 
@@ -55,7 +55,7 @@ const GRID_SIZE = 50;
 // Movement / mass-to-radius
 const BASE_SPEED = 260;        // px/sec at REFERENCE_MASS
 const REFERENCE_MASS = 20;
-const SPEED_FALLOFF = 0.45;    // speed = BASE_SPEED * (REFERENCE_MASS/mass)^SPEED_FALLOFF
+const SPEED_FALLOFF = 0.25;    // speed = BASE_SPEED * (REFERENCE_MASS/mass)^SPEED_FALLOFF
 const MASS_RADIUS_SCALE = 6;   // radius = sqrt(mass/PI) * MASS_RADIUS_SCALE
 const START_MASS = 20;
 
@@ -72,6 +72,7 @@ const BOT_EAT_MARGIN = 1.25;           // must be 25% bigger to safely hunt
 const BOT_REEVAL_INTERVAL = { easy: 1.0, medium: 0.5, hard: 0.2 }; // seconds
 const BOT_BORED_AFTER = [8, 15];       // seconds range, randomized per chase
 const BOT_BORED_COOLDOWN = [10, 20];   // seconds range before re-targeting player
+const BOT_RESPAWN_DELAY = [3, 7];      // seconds before an eliminated bot returns
 
 // Split & eject (Phase 4)
 const SPLIT_MIN_MASS = 40;             // can't split below this
@@ -91,13 +92,15 @@ const VIRUS_FIRE_THRESHOLD = 150;      // mass at which a fed virus fires
 const VIRUS_FIRE_DISTANCE = 800;       // world units it launches
 const VIRUS_POP_MIN_PIECES = 3;
 const VIRUS_POP_MAX_PIECES = 7;
+const VIRUS_RESPAWN_DELAY = 1.5;       // seconds after a pop
 
 // Camera / leaderboard (Phase 6)
 const BASE_ZOOM = 1.0;
 const BASE_ZOOM_MASS = START_MASS;
-const MIN_ZOOM = 0.35;
+const MIN_ZOOM = 0.12;
 const MAX_ZOOM = 1.0;
 const ZOOM_LERP = 0.05;
+const CAMERA_FRAME_PADDING = 1.25;    // keeps owned pieces inside the viewport
 const LEADERBOARD_SIZE = 10;
 const LEADERBOARD_REFRESH_MS = 250;
 ```
@@ -134,7 +137,10 @@ one phase's code.
 { x, y, radius: FOOD_RADIUS, color }
 
 // Virus
-{ x, y, mass: VIRUS_BASE_MASS, radius, vx: 0, vy: 0, firing: false }
+{
+  x, y, mass: VIRUS_BASE_MASS, radius, vx: 0, vy: 0,
+  firing: false, active: true, travelRemaining: 0, respawnAt: 0
+}
 
 // Ejected mass
 { x, y, vx, vy, mass: EJECTED_MASS_MASS, radius, ownerId }
@@ -162,7 +168,7 @@ all blobs sharing an `ownerId` for the leaderboard, camera framing, and
 | 0 (done) | Canvas fills window, resizes cleanly, stable rAF loop, test circle renders. |
 | 1 (done) | Player moves smoothly toward mouse, slower at higher mass, camera pans, grid/boundary prove world/screen conversion is correct, player can't leave world bounds. |
 | 2 | Fixed food count maintained, player grows via `sqrt` radius formula on eating, food never spawns inside a blob. |
-| 3 | 10-15 bots visibly show all 4 states (seeking food, hunting, fleeing, going bored and wandering off) without jitter. |
+| 3 | 10-15 bots visibly show all 4 states (seeking food, hunting, fleeing, going bored and wandering off) without jitter, with difficulty-based target prediction and boundary-aware movement. |
 | 4 | Space splits into two co-controlled pieces sharing `ownerId`; pieces can't re-merge before `MERGE_COOLDOWN`; eject key spawns a decelerating mass blob that others can eat. |
 | 5 | Virus pops any bigger blob that touches it into 3-7 pieces; ejecting mass into a virus grows it and it fires along the ejection trajectory once `VIRUS_FIRE_THRESHOLD` is crossed. |
 | 6 | Zoom smoothly interpolates out as total owned mass grows (never snaps); camera frames all owned pieces post-split; leaderboard shows top 10 by summed `ownerId` mass, refreshed every ~250ms. |
