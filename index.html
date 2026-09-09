@@ -55,6 +55,12 @@ const BOT_BORED_AFTER = [8, 15];
 const BOT_BORED_COOLDOWN = [10, 20];
 const BOT_PREDICTION_TIME = { easy: 0.15, medium: 0.35, hard: 0.65 };
 const BOT_BOUNDARY_MARGIN = 180;
+const BOT_RESPAWN_DELAY = [3, 7];
+const BOT_MASS_RANGES = {
+  easy: [14, 34],
+  medium: [24, 58],
+  hard: [38, 86]
+};
 const SPLIT_MIN_MASS = 40;
 const SPLIT_KICK_SPEED = 500;
 const SPLIT_KICK_DECAY = 3.0;
@@ -63,7 +69,7 @@ const EJECT_MASS_COST = 14;
 const EJECTED_MASS_MASS = 12;
 const EJECTED_MASS_SPEED = 700;
 const EJECTED_MASS_DECAY = 4.0;
-const VIRUS_COUNT = 30;
+const VIRUS_COUNT = 0;
 const VIRUS_BASE_MASS = 100;
 const VIRUS_SPIKES = 12;
 const VIRUS_FIRE_THRESHOLD = 150;
@@ -73,9 +79,10 @@ const VIRUS_POP_MAX_PIECES = 7;
 const VIRUS_RESPAWN_DELAY = 1.5;
 const BASE_ZOOM = 1.0;
 const BASE_ZOOM_MASS = START_MASS;
-const MIN_ZOOM = 0.35;
+const MIN_ZOOM = 0.12;
 const MAX_ZOOM = 1.0;
 const ZOOM_LERP = 0.05;
+const CAMERA_FRAME_PADDING = 1.25;
 const LEADERBOARD_SIZE = 10;
 const LEADERBOARD_REFRESH_MS = 250;
 
@@ -112,6 +119,7 @@ const player = {
 };
 const playerBlobs = [player];
 const bots = [];
+const botRespawns = [];
 const ejectedMass = [];
 const viruses = [];
 let nextBlobId = 1;
@@ -189,11 +197,13 @@ function findSafeSpawnPosition(radius, includeViruses) {
   return position;
 }
 
-function createBot(index) {
-  const difficulty = randomBotDifficulty();
-  const mass = randomRange(14, 42);
+function createBot(index, difficultyOverride) {
+  const difficulty = difficultyOverride || randomBotDifficulty();
+  const massRange = BOT_MASS_RANGES[difficulty];
+  const mass = randomRange(massRange[0], massRange[1]);
   const bot = {
     id: 'bot_' + index,
+    botSlot: index,
     ownerId: 'bot_' + index,
     x: 0,
     y: 0,
@@ -413,21 +423,26 @@ function updateCamera(dt) {
 
   let centerX = 0;
   let centerY = 0;
-  let maxDistance = 0;
+  let boundsMinX = Infinity;
+  let boundsMaxX = -Infinity;
+  let boundsMinY = Infinity;
+  let boundsMaxY = -Infinity;
   for (const blob of owned) {
     centerX += blob.x;
     centerY += blob.y;
+    boundsMinX = Math.min(boundsMinX, blob.x - blob.radius);
+    boundsMaxX = Math.max(boundsMaxX, blob.x + blob.radius);
+    boundsMinY = Math.min(boundsMinY, blob.y - blob.radius);
+    boundsMaxY = Math.max(boundsMaxY, blob.y + blob.radius);
   }
   centerX /= owned.length;
   centerY /= owned.length;
-  for (const blob of owned) {
-    maxDistance = Math.max(maxDistance, Math.hypot(blob.x - centerX, blob.y - centerY) + blob.radius);
-  }
 
   const totalMass = Math.max(1, getTotalMass(player.ownerId));
-  const massZoom = BASE_ZOOM / Math.sqrt(totalMass / BASE_ZOOM_MASS);
-  const viewportRadius = Math.max(1, Math.min(canvas.width, canvas.height) * 0.42);
-  const spreadZoom = viewportRadius / Math.max(viewportRadius, maxDistance);
+  const massZoom = BASE_ZOOM / Math.pow(totalMass / BASE_ZOOM_MASS, 0.45);
+  const frameWidth = Math.max(1, (boundsMaxX - boundsMinX) * CAMERA_FRAME_PADDING);
+  const frameHeight = Math.max(1, (boundsMaxY - boundsMinY) * CAMERA_FRAME_PADDING);
+  const spreadZoom = Math.min(canvas.width / frameWidth, canvas.height / frameHeight);
   const targetZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, massZoom, spreadZoom));
   camera.zoom += (targetZoom - camera.zoom) * (1 - Math.pow(1 - ZOOM_LERP, Math.max(1, dt * 60)));
 
@@ -609,18 +624,27 @@ function botDirection(bot) {
 
 function grantDeveloperMass() {
   const owned = ownedPlayerBlobs();
-  const target = owned.reduce((largest, blob) =>
-    !largest || blob.mass > largest.mass ? blob : largest, null);
-  if (target) {
-    target.mass += 100;
-    updateRadiusFromMass(target);
+  const totalMass = owned.reduce((sum, blob) => sum + blob.mass, 0);
+  if (totalMass > 0) {
+    for (const blob of owned) {
+      blob.mass += 1000 * (blob.mass / totalMass);
+      updateRadiusFromMass(blob);
+    }
   } else if (!playerRespawnAt) {
-    player.mass += 100;
+    player.mass += 1000;
     updateRadiusFromMass(player);
   }
 }
 
 function updateBots(dt, now) {
+  for (let i = botRespawns.length - 1; i >= 0; i--) {
+    const respawn = botRespawns[i];
+    if (now < respawn.respawnAt) continue;
+    if (!activeBlobs().some((blob) => blob.ownerId === 'bot_' + respawn.botSlot)) {
+      bots.push(createBot(respawn.botSlot));
+    }
+    botRespawns.splice(i, 1);
+  }
   for (const bot of bots) {
     reevaluateBot(bot, now);
     moveBlob(bot, botDirection(bot), dt);
@@ -662,7 +686,8 @@ function splitBlob(blob, direction, now) {
     targetX: 0,
     targetY: 0,
     canSplit: blob.canSplit,
-    canEject: blob.canEject
+    canEject: blob.canEject,
+    botSlot: blob.botSlot
   };
   updateRadiusFromMass(child);
   child.x += direction.x * (blob.radius + child.radius + 2);
@@ -688,6 +713,7 @@ function createVirusPiece(blob, mass, direction, now, index) {
     isBot: blob.isBot
   };
   if (blob.isBot) {
+    piece.botSlot = blob.botSlot;
     piece.state = 'SEEKING_FOOD';
     piece.difficulty = blob.difficulty || 'easy';
     piece.targetId = null;
@@ -873,7 +899,15 @@ function resolveEjectedMass() {
 function removeBlob(blob) {
   const collection = blob.isBot ? bots : playerBlobs;
   const index = collection.indexOf(blob);
-  if (index !== -1) collection.splice(index, 1);
+  if (index === -1) return;
+  collection.splice(index, 1);
+  if (blob.isBot && !activeBlobs().some((candidate) => candidate.ownerId === blob.ownerId) &&
+      !botRespawns.some((respawn) => respawn.botSlot === blob.botSlot)) {
+    botRespawns.push({
+      botSlot: blob.botSlot,
+      respawnAt: gameTime + randomRange(BOT_RESPAWN_DELAY[0], BOT_RESPAWN_DELAY[1])
+    });
+  }
 }
 
 function mergeBlobs(first, second) {

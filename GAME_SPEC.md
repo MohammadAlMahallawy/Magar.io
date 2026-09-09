@@ -72,6 +72,7 @@ const BOT_EAT_MARGIN = 1.25;           // must be 25% bigger to safely hunt
 const BOT_REEVAL_INTERVAL = { easy: 1.0, medium: 0.5, hard: 0.2 }; // seconds
 const BOT_BORED_AFTER = [8, 15];       // seconds range, randomized per chase
 const BOT_BORED_COOLDOWN = [10, 20];   // seconds range before re-targeting player
+const BOT_RESPAWN_DELAY = [3, 7];      // seconds before an eliminated bot returns
 
 // Split & eject (Phase 4)
 const SPLIT_MIN_MASS = 40;             // can't split below this
@@ -96,9 +97,10 @@ const VIRUS_RESPAWN_DELAY = 1.5;       // seconds after a pop
 // Camera / leaderboard (Phase 6)
 const BASE_ZOOM = 1.0;
 const BASE_ZOOM_MASS = START_MASS;
-const MIN_ZOOM = 0.35;
+const MIN_ZOOM = 0.12;
 const MAX_ZOOM = 1.0;
 const ZOOM_LERP = 0.05;
+const CAMERA_FRAME_PADDING = 1.25;    // keeps owned pieces inside the viewport
 const LEADERBOARD_SIZE = 10;
 const LEADERBOARD_REFRESH_MS = 250;
 ```
